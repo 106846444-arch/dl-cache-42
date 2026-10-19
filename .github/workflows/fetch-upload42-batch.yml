@@ -24,12 +24,15 @@ jobs:
       #   改用下面 heredoc 直接把 inputs.urls 写进文件。
       COOKIE: ${{ inputs.cookie }}
       UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      # GitHub Release 单附件硬上限 2 GiB，超过会 422 拒绝。留 5% 余量防边界。
+      MAX_BYTES: 2147483648
 
     steps:
       - name: 1. 逐个取直链并下载
         id: dl
         run: |
           mkdir -p out
+          touch skipped.txt
           cat > urls.txt <<'UPURLS'
           ${{ inputs.urls }}
           UPURLS
@@ -37,6 +40,7 @@ jobs:
           mv urls.clean urls.txt
           echo "共 $(wc -l < urls.txt) 个链接"
           i=0
+          nskip=0
           while IFS= read -r U; do
             i=$((i+1))
             ID=$(printf '%s' "$U" | sed -E 's#https?://[^/]+/([A-Za-z0-9]+)/.*#\1#')
@@ -58,6 +62,20 @@ jobs:
               | tail -1)
             if [ -z "$LOC" ]; then
               echo "::warning::[$NAME] 没拿到直链（多半 Cookie 过期），跳过"
+              echo "$U" >> skipped.txt
+              nskip=$((nskip+1))
+              continue
+            fi
+            # ★ 下载前先 HEAD 看 Content-Length：超上限就别下了，省几百 MB 白流量
+            LEN=$(curl -sS -I -L -H "User-Agent: $UA" -H "Cookie: $COOKIE" \
+                    --connect-timeout 60 "$LOC" \
+                  | tr -d '\r' \
+                  | awk 'tolower($0) ~ /^content-length:/ {print substr($0, index($0,":")+2)}' \
+                  | tail -1)
+            if [ -n "$LEN" ] && [ "$LEN" -gt "$MAX_BYTES" ] 2>/dev/null; then
+              echo "::warning::[$NAME] $LEN 字节 > 2GiB，Release 装不下，跳过"
+              echo "$U" >> skipped.txt
+              nskip=$((nskip+1))
               continue
             fi
             # 该站不支持 Range，只能单连接；靠 --retry 扛中断
@@ -66,16 +84,28 @@ jobs:
                  -H "User-Agent: $UA" \
                  -o "out/$NAME" "$LOC"
             SZ=$(stat -c%s "out/$NAME" 2>/dev/null || echo 0)
+            if [ "$SZ" -gt "$MAX_BYTES" ]; then
+              echo "::warning::[$NAME] 下载后 $SZ 字节 > 2GiB，Release 装不下，丢弃"
+              rm -f "out/$NAME"
+              echo "$U" >> skipped.txt
+              nskip=$((nskip+1))
+              continue
+            fi
             if [ "$SZ" -lt 1048576 ]; then
               echo "::warning::[$NAME] 只有 $SZ 字节，明显不对，丢弃"
               rm -f "out/$NAME"
+              echo "$U" >> skipped.txt
+              nskip=$((nskip+1))
             else
               echo "  ✓ $NAME  $SZ 字节"
             fi
           done < urls.txt
           echo "---- 结果 ----"
-          ls -lh out/
-          if [ -z "$(ls -A out)" ]; then
+          echo "成功 $(ls -1 out 2>/dev/null | wc -l) 个 / 跳过 $nskip 个"
+          ls -lh out/ 2>/dev/null
+          echo "---- 跳过清单（skipped.txt）----"
+          cat skipped.txt
+          if [ -z "$(ls -A out)" ] && [ ! -s skipped.txt ]; then
             echo "::error::一个文件都没下下来，请检查 Cookie 是否有效"
             exit 1
           fi
@@ -85,7 +115,12 @@ jobs:
         with:
           tag_name: up42-batch-${{ github.run_number }}
           name: upload42 批次 #${{ github.run_number }}
-          files: out/*
+          # skipped.txt 是本批「被跳过/没拿到的链接」清单，软件读它才能把
+          # 机房这一层拦下的东西也报给用户；它同时会被 Release 发出去。
+          fail_on_unmatched_files: false
+          files: |
+            out/*
+            skipped.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
