@@ -105,6 +105,15 @@ jobs:
           ls -lh out/ 2>/dev/null
           echo "---- 跳过清单（skipped.txt）----"
           cat skipped.txt
+          # ★ 2026-10-19 修 BUG（我自己埋的雷）：空的 skipped.txt 会让 Release 上传失败
+          #   —— GitHub 校验报 "size must be greater than 0"，softprops 因此把整个
+          #   「发布到 Release」步骤判成 failure，尽管 10 个文件其实全部上传成功了。
+          #   没有跳过项时直接删掉它：files 里虽配了它，但已设 fail_on_unmatched_files:false，
+          #   文件不存在不会报错。
+          if [ ! -s skipped.txt ]; then
+            echo "(本批无跳过项，删除空的 skipped.txt，避免 Release 上传 0 字节文件失败)"
+            rm -f skipped.txt
+          fi
           if [ -z "$(ls -A out)" ] && [ ! -s skipped.txt ]; then
             echo "::error::一个文件都没下下来，请检查 Cookie 是否有效"
             exit 1
