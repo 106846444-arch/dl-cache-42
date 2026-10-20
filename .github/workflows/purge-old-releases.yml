@@ -1,0 +1,91 @@
+name: purge-old-releases
+
+# ---------------------------------------------------------------------------
+# 2026-10-20 新增：给「④ UP 中转」做 Release 清理兜底。
+#
+# 背景（用户实机踩到）：
+#   正常清理是【软件侧】做的 —— 每批送完云盘后，程序内部后台线程等
+#   up_purge_delay_min（默认 10 分钟）到点，再调 GitHub API 删掉那个 Release，
+#   所以日志里才会写「期间别关软件」。只要你提前关了软件，那批就没人删了：
+#   实测就漏下 up42-batch-3 / up42-batch-4 两个 Release、共 14.45 GB 挂在仓库上。
+#
+# 这个 workflow 跑在 GitHub 自己的机器上，跟你软件开不开【完全无关】：
+#   每 15 分钟扫一遍，删掉「创建时间超过 KEEP_MIN 分钟」的 Release。
+#   它只在软件漏删时才出手（KEEP_MIN=20 > 软件侧的 10 分钟），
+#   正常情况轮不到它，所以不会把迅雷还没拉完的文件删早。
+#
+# 为什么 Release 保留期不能太长：
+#   仓库是 public，Release 里的文件全世界可下载，保留期就是暴露窗口。
+#
+# 注意：GitHub 的 schedule 不是严格的定时器，高峰期可能晚几分钟触发，
+#   所以 KEEP_MIN 留了足够余量（20 分钟 vs 软件 10 分钟）。
+#   另外仓库 60 天无任何活动的话 GitHub 会自动停用定时任务 —— 我们一直在跑，不会。
+# ---------------------------------------------------------------------------
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      keep_minutes:
+        description: "保留多少分钟内创建的 Release（超过就删）"
+        required: false
+        default: "20"
+
+permissions:
+  contents: write
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 删除过期 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_MIN: ${{ github.event.inputs.keep_minutes || '20' }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import os, json, urllib.request, urllib.error, datetime
+
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["REPO"]
+          keep = float(os.environ.get("KEEP_MIN") or 20)
+          H = {"Authorization": "Bearer " + token,
+               "Accept": "application/vnd.github+json",
+               "User-Agent": "purge-old-releases"}
+
+          def api(path, method="GET"):
+              req = urllib.request.Request("https://api.github.com" + path,
+                                           headers=H, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.status, json.loads(r.read().decode() or "null")
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode("utf-8", "replace")[:200]
+
+          now = datetime.datetime.now(datetime.timezone.utc)
+          st, rels = api("/repos/" + repo + "/releases?per_page=100")
+          if st != 200 or not isinstance(rels, list):
+              print("列 Release 失败:", st, rels)
+              raise SystemExit(0)
+
+          freed = 0
+          n = 0
+          for r in rels:
+              created = datetime.datetime.strptime(
+                  r["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                  tzinfo=datetime.timezone.utc)
+              age = (now - created).total_seconds() / 60.0
+              size = sum(a.get("size", 0) for a in r.get("assets", []))
+              if age >= keep:
+                  st2, _ = api("/repos/" + repo + "/releases/" + str(r["id"]), "DELETE")
+                  print("  删除 %s（%.0f 分钟前, %.2f GB）-> HTTP %s"
+                        % (r["tag_name"], age, size / 1024 / 1024 / 1024, st2))
+                  if st2 in (200, 204):
+                      freed += size
+                      n += 1
+              else:
+                  print("  保留 %s（%.0f 分钟, 未到 %.0f 分钟）"
+                        % (r["tag_name"], age, keep))
+          print("共删除 %d 个 Release，释放 %.2f GB" % (n, freed / 1024 / 1024 / 1024))
+          PY
