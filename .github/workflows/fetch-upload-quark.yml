@@ -1,0 +1,323 @@
+name: 机房下载并直传夸克
+
+# ★ 这是 NIT「机房中转」的终态形态（2026-10-22 定案）。
+#   旧链路：机房下载 → 发 Release → 本地镜像拉回 → 本地上传夸克
+#           实测 537MB 单条共 252 秒，其中【拉回 92s + 上传 80s = 172s 占 69%】，
+#           纯粹是因为数据要在用户本机绕一圈。
+#   新链路：机房下载 → 【机房直接上传夸克】→ 本地只做结果校验
+#           省掉本地拉回和本地上传两整趟，预计 252 秒 → 60~90 秒。
+#
+# 前提（已具备）：
+#   · 仓库 Secret QUARK_AUTH_JSON = 本地 quark_skill/workbuddy/config.json 的内容
+#     （CLI 的 resolveConfigPath 固定读 dirname(scripts)/<profile>/config.json）
+#   · CLI 必须带 CLIENT_INFO_* = WorkBuddy 环境变量，否则报 -104
+#   · 机房换不出 NIT 直链（页面带验证码/登录墙），直链仍由本地专用 Edge 提取
+#
+# 校验方式：本机事后用 CLI search 按「文件名 + 大小」确认云端存在，
+#   所以这里不必把上传结果回传，日志留痕即可。
+
+on:
+  workflow_dispatch:
+    inputs:
+      items_b64:
+        description: 'base64(JSON数组)，每项 {"name":"文件名","url":"直链","referer":"可选"}'
+        required: true
+      folder:
+        description: '夸克目标文件夹（不存在会自动建，幂等）'
+        required: false
+        default: 'NIT'
+      cookie:
+        description: '可选：站点登录 Cookie'
+        required: false
+        default: ''
+      threads:
+        description: '每文件的下载并发连接数'
+        required: false
+        default: '8'
+
+jobs:
+  fetch_upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      ITEMS_B64: ${{ inputs.items_b64 }}
+      COOKIE: ${{ inputs.cookie }}
+      THREADS: ${{ inputs.threads }}
+      FOLDER: ${{ inputs.folder }}
+      UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      HARD_MAX_BYTES: 12884901888
+
+    steps:
+      - name: 1. 解析任务清单
+        run: |
+          python3 - <<'PYEOF'
+          import base64, json, os
+          items = json.loads(base64.b64decode(os.environ["ITEMS_B64"]).decode("utf-8"))
+          print("共 %d 个任务，目标夸克目录：%s" % (len(items), os.environ.get("FOLDER")))
+          for it in items:
+              print("  -", it.get("name"), "->", (it.get("url") or "")[:110])
+          PYEOF
+
+      - name: 2. 多线程 Range 下载
+        run: |
+          cat > dl.py <<'PYEOF'
+          import base64, json, os, sys, threading, time, urllib.request
+
+          items = json.loads(base64.b64decode(os.environ["ITEMS_B64"]).decode("utf-8"))
+          COOKIE = os.environ.get("COOKIE", "")
+          THREADS = max(int(os.environ.get("THREADS") or 8), 1)
+          UA = os.environ.get("UA", "Mozilla/5.0")
+          HARD_MAX = int(os.environ.get("HARD_MAX_BYTES", "12884901888"))
+          OUT = "out"
+          os.makedirs(OUT, exist_ok=True)
+          done, skipped = [], []
+
+          def hdrs(ref=None):
+              h = {"User-Agent": UA}
+              if ref:
+                  h["Referer"] = ref
+              if COOKIE:
+                  h["Cookie"] = COOKIE
+              return h
+
+          def probe(u, ref):
+              try:
+                  req = urllib.request.Request(u, headers=dict(hdrs(ref), Range="bytes=0-0"))
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      cr = r.headers.get("Content-Range") or ""
+                      code = r.getcode()
+                      r.read(64)
+                      if code == 206 and "/" in cr:
+                          return int(cr.rsplit("/", 1)[-1]), True
+                      cl = r.headers.get("Content-Length")
+                      return (int(cl) if cl else 0), False
+              except Exception as e:
+                  print("  探测失败: %s" % e)
+                  return 0, False
+
+          def safe_name(n):
+              n = (n or "").strip() or "file.bin"
+              for c in '/\\:*?"<>|':
+                  n = n.replace(c, "_")
+              return n[:180]
+
+          def parallel(u, ref, total, path):
+              with open(path, "wb") as f:
+                  f.truncate(total)
+              chunk = max(total // THREADS, 1)
+              errs = []
+              got = [0]
+              lock = threading.Lock()
+
+              def worker(i):
+                  s = i * chunk
+                  e = min(s + chunk - 1, total - 1)
+                  pos = s
+                  if s > e:
+                      return
+                  for attempt in range(10):
+                      try:
+                          req = urllib.request.Request(
+                              u, headers=dict(hdrs(ref), Range="bytes=%d-%d" % (pos, e)))
+                          with urllib.request.urlopen(req, timeout=180) as r:
+                              if r.getcode() != 206:
+                                  raise RuntimeError("HTTP %s" % r.getcode())
+                              with open(path, "r+b") as f:
+                                  f.seek(pos)
+                                  while True:
+                                      b = r.read(1 << 19)
+                                      if not b:
+                                          break
+                                      f.write(b)
+                                      pos += len(b)
+                                      with lock:
+                                          got[0] += len(b)
+                          if pos > e:
+                              return
+                      except Exception as ex:
+                          if attempt == 9:
+                              errs.append((i, str(ex)))
+                          else:
+                              time.sleep(3)
+                  if pos <= e:
+                      errs.append((i, "未完成 %d-%d" % (pos, e)))
+
+              ts = [threading.Thread(target=worker, args=(i,), daemon=True)
+                    for i in range(THREADS)]
+              t0 = time.time()
+              for t in ts:
+                  t.start()
+              while any(t.is_alive() for t in ts):
+                  time.sleep(15)
+                  el = time.time() - t0
+                  print("    ... %.1fMB / %.1fMB  %.2fMB/s  (%.0fs)"
+                        % (got[0] / 1048576.0, total / 1048576.0,
+                           got[0] / 1048576.0 / max(el, 1), el), flush=True)
+              for t in ts:
+                  t.join(30)
+              return errs, time.time() - t0
+
+          def single(u, ref, path):
+              t0 = time.time()
+              for attempt in range(10):
+                  try:
+                      req = urllib.request.Request(u, headers=hdrs(ref))
+                      with urllib.request.urlopen(req, timeout=180) as r, open(path, "wb") as f:
+                          while True:
+                              b = r.read(1 << 19)
+                              if not b:
+                                  break
+                              f.write(b)
+                      return [], time.time() - t0
+                  except Exception as e:
+                      if attempt == 9:
+                          return [(0, str(e))], time.time() - t0
+                      time.sleep(5)
+
+          for idx, it in enumerate(items, 1):
+              name = safe_name(it.get("name"))
+              u = (it.get("url") or "").strip()
+              ref = it.get("referer") or ""
+              print("---- [%d/%d] %s ----" % (idx, len(items), name), flush=True)
+              if not u:
+                  skipped.append("%s\t没有直链" % name)
+                  continue
+              total, rng = probe(u, ref)
+              if total and total > HARD_MAX:
+                  skipped.append("%s\t%d字节超磁盘上限" % (name, total))
+                  continue
+              path = os.path.join(OUT, name)
+              if rng and total:
+                  errs, el = parallel(u, ref, total, path)
+              else:
+                  errs, el = single(u, ref, path)
+              if not os.path.exists(path):
+                  skipped.append("%s\t下载失败" % name)
+                  continue
+              sz = os.path.getsize(path)
+              if errs or (total and sz != total):
+                  why = ("分片错误 %s" % errs[:2]) if errs else ("大小 %d≠%d" % (sz, total))
+                  print("  ::warning:: %s 不完整: %s" % (name, why))
+                  os.remove(path)
+                  skipped.append("%s\t%s" % (name, why))
+                  continue
+              if sz < 1048576:
+                  print("  ::warning:: %s 只有 %d 字节，丢弃" % (name, sz))
+                  os.remove(path)
+                  skipped.append("%s\t只有%d字节" % (name, sz))
+                  continue
+              print("  ✓ %s  %d字节  用时 %.1fs  均速 %.2fMB/s"
+                    % (name, sz, el, sz / 1048576.0 / max(el, 1)), flush=True)
+              done.append({"name": name, "path": path, "size": sz})
+
+          json.dump({"done": done, "skipped": skipped},
+                    open("dl_result.json", "w", encoding="utf-8"))
+          print("---- 下载完成：成功 %d / 跳过 %d ----" % (len(done), len(skipped)))
+          if not done:
+              print("::error::一个文件都没下下来")
+              sys.exit(1)
+          PYEOF
+          python3 dl.py
+
+      - name: 3. 装夸克 CLI 并落授权
+        # ★ 凭证必须走 env 传：JSON 里全是双引号，直接在 bash 里 ${{ }} 展开
+        #   会破坏引号配对（实测写入被截断、JSON 解析失败）。
+        env:
+          QUARK_AUTH_JSON: ${{ secrets.QUARK_AUTH_JSON }}
+        run: |
+          mkdir -p qs
+          curl -sL --retry 2 --connect-timeout 20 -o qs/q.zip \
+            "https://pdds.quark.cn/download/stfile/kkqqltosqklokmsmf/quarkclouddrive-1.0.12.zip"
+          unzip -q qs/q.zip -d qs/unz
+          CLI=$(find qs/unz -name "quark-drive.cjs" | head -1)
+          SDIR=$(dirname "$CLI")
+          mkdir -p quark_skill/scripts quark_skill/workbuddy
+          cp -r "$SDIR"/* quark_skill/scripts/ 2>/dev/null || true
+          printf '%s' "$QUARK_AUTH_JSON" > quark_skill/workbuddy/config.json
+          echo "CLI 就位，凭证 $(wc -c < quark_skill/workbuddy/config.json) 字节"
+
+      - name: 4. 上传夸克
+        env:
+          CLIENT_INFO_IDE_TYPE: WorkBuddy
+          CLIENT_INFO_PLATFORM: WorkBuddy
+          CLIENT_INFO_PRODUCT_NAME: WorkBuddy
+          FOLDER: ${{ inputs.folder }}
+        run: |
+          cat > up.py <<'PYEOF'
+          import json, os, subprocess, sys, time
+
+          r = json.load(open("dl_result.json", encoding="utf-8"))
+          done = r["done"]
+          folder = os.environ.get("FOLDER") or "NIT"
+          SCRIPTS = "quark_skill/scripts"
+          ok, bad = [], []
+
+          def cli(args, timeout=7200):
+              cmd = ["node", "quark-drive.cjs"] + args + [
+                  "--session-input", "机房直传", "--session-id", "gh-actions"]
+              p = subprocess.run(cmd, capture_output=True, text=True,
+                                 cwd=SCRIPTS, timeout=timeout)
+              last = None
+              for ln in (p.stdout or "").splitlines():
+                  try:
+                      o = json.loads(ln)
+                  except Exception:
+                      continue
+                  if o.get("type") == "result":
+                      last = o
+              return last or {"code": -1, "msg": (p.stderr or "")[-300:]}
+
+          # 建目录（幂等，不传 --parent-fid 会建到平台默认目录，根目录必须显式 "0"）
+          res = cli(["create-folder", "--dir-path", folder, "--parent-fid", "0"])
+          print("create-folder ->", res.get("code"), res.get("msg"))
+          if res.get("code") != 0:
+              print("::error::建目录失败: %s" % res.get("msg"))
+              sys.exit(1)
+          fid = ((res.get("data") or {}).get("fid")
+                 or (res.get("data") or {}).get("id") or "")
+          print("目标目录 fid =", fid)
+
+          for it in done:
+              name, path, sz = it["name"], it["path"], it["size"]
+              t0 = time.time()
+              try:
+                  res = cli(["upload", path, "--parent-fid", fid])
+              except subprocess.TimeoutExpired:
+                  bad.append({"name": name, "msg": "上传超时"})
+                  continue
+              el = time.time() - t0
+              code = res.get("code")
+              d = res.get("data") or {}
+              instant = bool(d.get("instantUpload"))
+              if code == 0:
+                  ok.append({"name": name, "size": sz,
+                             "instant": instant, "sec": round(el, 1)})
+                  print("✓ 上传完成 %s  %d字节  用时 %.1fs  均速 %.2fMB/s%s"
+                        % (name, sz, el, sz / 1048576.0 / max(el, 1),
+                           "  [秒传]" if instant else ""), flush=True)
+              else:
+                  bad.append({"name": name, "msg": res.get("msg") or ("code=%s" % code)})
+                  print("✗ 上传失败 %s : %s" % (name, res.get("msg")), flush=True)
+
+          json.dump({"ok": ok, "bad": bad, "folder": folder},
+                    open("up_result.json", "w", encoding="utf-8"))
+          print("---- 上传结果：成功 %d / 失败 %d ----" % (len(ok), len(bad)))
+          if not ok:
+              print("::error::一个都没传上去")
+              sys.exit(1)
+          PYEOF
+          python3 up.py
+
+      - name: 5. 结果摘要
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          for f in ("dl_result.json", "up_result.json"):
+              if not os.path.exists(f):
+                  continue
+              d = json.load(open(f, encoding="utf-8"))
+              print("==== %s ====" % f)
+              print(json.dumps(d, ensure_ascii=False, indent=2)[:3000])
+          PYEOF
