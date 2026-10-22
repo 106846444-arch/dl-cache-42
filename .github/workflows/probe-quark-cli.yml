@@ -57,7 +57,7 @@ jobs:
           CLIENT_INFO_PRODUCT_NAME: WorkBuddy
         run: |
           cd quark_skill/scripts
+          # 注意：--stdout-only 只有 search 支持，get-user-info 传了会报 unknown option
           node quark-drive.cjs get-user-info \
-            --session-input "机房可行性验证" --session-id "probe-1" \
-            --stdout-only 2>&1 | head -40
-          echo "退出码: $?"
+            --session-input "机房可行性验证" --session-id "probe-1" 2>&1 | head -40
+          echo "退出码: ${PIPESTATUS[0]}"
