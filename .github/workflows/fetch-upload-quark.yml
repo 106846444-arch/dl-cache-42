@@ -358,11 +358,15 @@ jobs:
         if: always()
         run: |
           python3 - <<'PYEOF'
-          import json, os
+          import base64, json, os
+          # ★ 必须 base64 输出，不能直接 print JSON：
+          #   Secret 的值本身就是一段 JSON，GitHub 会把【出现在 Secret 里的标点】
+          #   在日志里打码成 ***（实测 { } [ ] 全变成 ***），软件根本没法解析。
+          #   base64 字符集里没有这些符号，不会被 mask。
           for f in ("dl_result.json", "up_result.json"):
               if not os.path.exists(f):
                   continue
               d = json.load(open(f, encoding="utf-8"))
-              print("==== %s ====" % f)
-              print(json.dumps(d, ensure_ascii=False, indent=2)[:3000])
+              print("RESULT_B64 %s %s" % (f, base64.b64encode(
+                  json.dumps(d, ensure_ascii=False).encode("utf-8")).decode("ascii")))
           PYEOF
