@@ -1,0 +1,254 @@
+name: 直链批量拉取并发布 Release
+
+# 由「116NIT下载助手（夸克版）」的 NIT 页通过 API 自动触发。
+#
+# ★ 和 fetch-upload42-batch.yml 的区别：那边收的是「文件页 URL」，机房自己 POST 换直链；
+#   这边收的是【本地已经提取好的直链】。
+#   必须这样拆的原因（2026-10-22 实测）：NIT 文件页在机房里抓下来是带验证码/登录墙的，
+#   grep 不到 nitroflare.com/d/... 的直链 —— 也就是机房【换不出】NIT 直链，
+#   只有本地的专用 Edge（有登录态、能过人机校验）才提得出来。
+#   于是分工：本地负责「换直链」，机房只负责「用直链高速下载」。
+#
+# ★ 为什么值得绕这一圈（2026-10-22 实测同一条 NIT 直链）：
+#     本地 8 线程   0.97 MB/s
+#     机房 8 线程  35.86 MB/s   ← 约 37 倍
+#   机房在美国圣何塞，到 NIT 的链路质量远好于本地家宽。
+on:
+  workflow_dispatch:
+    inputs:
+      items_b64:
+        description: 'base64(JSON数组)，每项 {"name":"文件名","url":"直链","referer":"可选来源页"}'
+        required: true
+      cookie:
+        description: '可选：站点登录 Cookie（多数直链不需要）'
+        required: false
+        default: ''
+      threads:
+        description: '每文件的并发连接数'
+        required: false
+        default: '8'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    env:
+      ITEMS_B64: ${{ inputs.items_b64 }}
+      COOKIE: ${{ inputs.cookie }}
+      THREADS: ${{ inputs.threads }}
+      UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      # GitHub Release 单附件硬上限 2 GiB，超了会 422 拒绝
+      MAX_BYTES: 2147483648
+      # ubuntu-latest 可用磁盘约 14GB，留余量到 12GB
+      HARD_MAX_BYTES: 12884901888
+
+    steps:
+      - name: 1. 解析任务清单
+        run: |
+          python3 - <<'PYEOF'
+          import base64, json, os
+          raw = os.environ.get("ITEMS_B64", "")
+          items = json.loads(base64.b64decode(raw).decode("utf-8"))
+          print("共 %d 个直链任务" % len(items))
+          for it in items:
+              print("  -", it.get("name"), "->", (it.get("url") or "")[:110])
+          PYEOF
+
+      - name: 2. 多线程 Range 下载
+        run: |
+          cat > dl.py <<'PYEOF'
+          import base64, json, os, sys, threading, time, urllib.request
+
+          items = json.loads(base64.b64decode(os.environ["ITEMS_B64"]).decode("utf-8"))
+          COOKIE = os.environ.get("COOKIE", "")
+          THREADS = max(int(os.environ.get("THREADS") or 8), 1)
+          UA = os.environ.get("UA", "Mozilla/5.0")
+          MAX_BYTES = int(os.environ.get("MAX_BYTES", "2147483648"))
+          HARD_MAX = int(os.environ.get("HARD_MAX_BYTES", "12884901888"))
+          OUT = "out"
+          os.makedirs(OUT, exist_ok=True)
+          skipped = []
+
+          def hdrs(ref=None):
+              h = {"User-Agent": UA}
+              if ref:
+                  h["Referer"] = ref
+              if COOKIE:
+                  h["Cookie"] = COOKIE
+              return h
+
+          def probe(u, ref):
+              """用 Range: bytes=0-0 探测：拿总长度 + 是否支持断点。比 HEAD 兼容性好。"""
+              try:
+                  req = urllib.request.Request(u, headers=dict(hdrs(ref), Range="bytes=0-0"))
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      cr = r.headers.get("Content-Range") or ""
+                      code = r.getcode()
+                      r.read(64)
+                      if code == 206 and "/" in cr:
+                          return int(cr.rsplit("/", 1)[-1]), True
+                      cl = r.headers.get("Content-Length")
+                      return (int(cl) if cl else 0), False
+              except Exception as e:
+                  print("  探测失败: %s" % e)
+                  return 0, False
+
+          def safe_name(n):
+              n = (n or "").strip() or "file.bin"
+              for c in '/\\:*?"<>|':
+                  n = n.replace(c, "_")
+              return n[:180]
+
+          def parallel(u, ref, total, path):
+              with open(path, "wb") as f:
+                  f.truncate(total)
+              chunk = max(total // THREADS, 1)
+              errs = []
+              got = [0]
+              lock = threading.Lock()
+
+              def worker(i):
+                  s = i * chunk
+                  e = min(s + chunk - 1, total - 1)
+                  pos = s
+                  if s > e:
+                      return
+                  for attempt in range(10):
+                      try:
+                          req = urllib.request.Request(
+                              u, headers=dict(hdrs(ref), Range="bytes=%d-%d" % (pos, e)))
+                          with urllib.request.urlopen(req, timeout=180) as r:
+                              if r.getcode() != 206:
+                                  raise RuntimeError("HTTP %s" % r.getcode())
+                              with open(path, "r+b") as f:
+                                  f.seek(pos)
+                                  while True:
+                                      b = r.read(1 << 19)
+                                      if not b:
+                                          break
+                                      f.write(b)
+                                      pos += len(b)
+                                      with lock:
+                                          got[0] += len(b)
+                          if pos > e:
+                              return
+                      except Exception as ex:
+                          if attempt == 9:
+                              errs.append((i, str(ex)))
+                          else:
+                              time.sleep(3)
+                  if pos <= e:
+                      errs.append((i, "未完成 %d-%d" % (pos, e)))
+
+              ts = [threading.Thread(target=worker, args=(i,), daemon=True)
+                    for i in range(THREADS)]
+              t0 = time.time()
+              for t in ts:
+                  t.start()
+              while any(t.is_alive() for t in ts):
+                  time.sleep(15)
+                  el = time.time() - t0
+                  sp = got[0] / 1048576.0 / max(el, 1)
+                  print("    ... %.1fMB / %.1fMB  %.2fMB/s  (%.0fs)"
+                        % (got[0] / 1048576.0, total / 1048576.0, sp, el), flush=True)
+              for t in ts:
+                  t.join(30)
+              return errs, time.time() - t0
+
+          def single(u, ref, path):
+              t0 = time.time()
+              for attempt in range(10):
+                  try:
+                      req = urllib.request.Request(u, headers=hdrs(ref))
+                      with urllib.request.urlopen(req, timeout=180) as r, open(path, "wb") as f:
+                          while True:
+                              b = r.read(1 << 19)
+                              if not b:
+                                  break
+                              f.write(b)
+                      return [], time.time() - t0
+                  except Exception as e:
+                      if attempt == 9:
+                          return [(0, str(e))], time.time() - t0
+                      time.sleep(5)
+
+          nok = 0
+          for idx, it in enumerate(items, 1):
+              name = safe_name(it.get("name"))
+              u = (it.get("url") or "").strip()
+              ref = it.get("referer") or ""
+              print("---- [%d/%d] %s ----" % (idx, len(items), name), flush=True)
+              if not u:
+                  skipped.append("%s\t没有直链" % name)
+                  continue
+              total, rng = probe(u, ref)
+              if total and total > HARD_MAX:
+                  msg = "%d 字节 > 磁盘承载上限 %d，放弃" % (total, HARD_MAX)
+                  print("  ::warning::" + msg)
+                  skipped.append("%s\t%s" % (name, msg))
+                  continue
+              path = os.path.join(OUT, name)
+              if rng and total:
+                  print("  长度 %d 字节，支持 Range，%d 线程并发" % (total, THREADS), flush=True)
+                  errs, el = parallel(u, ref, total, path)
+              else:
+                  print("  不支持 Range（长度=%s），退化为单连接" % (total or "未知"), flush=True)
+                  errs, el = single(u, ref, path)
+              if not os.path.exists(path):
+                  skipped.append("%s\t下载失败" % name)
+                  continue
+              sz = os.path.getsize(path)
+              if errs or (total and sz != total):
+                  why = ("分片错误 %s" % errs[:2]) if errs else ("大小 %d ≠ %d" % (sz, total))
+                  print("  ::warning:: %s 下载不完整: %s" % (name, why))
+                  os.remove(path)
+                  skipped.append("%s\t%s" % (name, why))
+                  continue
+              if sz < 1048576:
+                  print("  ::warning:: %s 只有 %d 字节，明显不对，丢弃" % (name, sz))
+                  os.remove(path)
+                  skipped.append("%s\t只有 %d 字节" % (name, sz))
+                  continue
+              print("  ✓ %s  %d 字节  用时 %.1fs  均速 %.2fMB/s"
+                    % (name, sz, el, sz / 1048576.0 / max(el, 1)), flush=True)
+              nok += 1
+
+          print("---- 结果：成功 %d / 跳过 %d ----" % (nok, len(skipped)))
+          if skipped:
+              with open("skipped.txt", "w", encoding="utf-8") as f:
+                  f.write("\n".join(skipped) + "\n")
+          if nok == 0:
+              print("::error::一个文件都没下下来")
+              sys.exit(1)
+          PYEOF
+          python3 dl.py
+
+      - name: 3. 超过 2GiB 的就地切卷（Release 单附件上限）
+        run: |
+          cd out
+          for f in *; do
+            [ -f "$f" ] || continue
+            SZ=$(stat -c%s "$f")
+            if [ "$SZ" -gt 2147483648 ]; then
+              echo "  ↳ $f 有 $SZ 字节 > 2GiB，切成 500MB 分卷"
+              split -b 500M -d -a 3 "$f" "${f}.part"
+              rm -f "$f"
+              echo "    $(ls -1 "${f}.part"* | wc -l) 卷"
+            fi
+          done
+          ls -lh
+
+      - name: 4. 发布到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: direct-batch-${{ github.run_number }}
+          name: 直链批次 #${{ github.run_number }}
+          fail_on_unmatched_files: false
+          files: |
+            out/*
+            skipped.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
