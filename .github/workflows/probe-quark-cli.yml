@@ -1,0 +1,59 @@
+name: 夸克 CLI 机房可行性验证
+
+# 一次性验证：机房能否装上夸克官方 CLI 并用 Secret 里的授权跑通。
+# 目的：为「机房直传夸克」铺路 —— 省掉本地拉回 + 本地上传两趟（实测占 69% 耗时）。
+# 只做只读操作（get-user-info / search），不上传任何文件。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 环境
+        run: |
+          echo "node: $(node -v)"
+          echo "OS: $(cat /etc/os-release | head -1)"
+
+      - name: 取夸克官方 CLI
+        run: |
+          mkdir -p qs
+          curl -sL --retry 2 --connect-timeout 20 \
+            -o qs/q.zip \
+            "https://pdds.quark.cn/download/stfile/kkqqltosqklokmsmf/quarkclouddrive-1.0.12.zip"
+          ls -lh qs/q.zip
+          echo "=== zip 内部 ==="
+          unzip -l qs/q.zip | head -30
+          unzip -q qs/q.zip -d qs/unz
+          echo "=== 找 CLI ==="
+          find qs/unz -name "quark-drive.cjs"
+          find qs/unz -name "hash-worker.cjs"
+
+      - name: 按 CLI 期望的目录结构摆放
+        # CLI 的 resolveConfigPath = dirname(scripts)/<profile>/config.json
+        # 本地实测 profile 是 workbuddy，所以必须是 scripts/ 的同级目录 workbuddy/
+        run: |
+          CLI=$(find qs/unz -name "quark-drive.cjs" | head -1)
+          SDIR=$(dirname "$CLI")
+          mkdir -p quark_skill/scripts quark_skill/workbuddy
+          cp "$SDIR"/*.cjs quark_skill/scripts/ 2>/dev/null || true
+          cp -r "$SDIR"/* quark_skill/scripts/ 2>/dev/null || true
+          ls -la quark_skill/scripts | head
+          printf '%s' "${{ secrets.QUARK_AUTH_JSON }}" > quark_skill/workbuddy/config.json
+          echo "config 字节数: $(wc -c < quark_skill/workbuddy/config.json)"
+          # 只确认是合法 JSON，绝不打印内容
+          node -e "const c=require('./quark_skill/workbuddy/config.json');console.log('config 顶层字段:',Object.keys(c).join(','))"
+
+      - name: 跑 get-user-info（验证授权是否可用）
+        env:
+          CLIENT_INFO_IDE_TYPE: WorkBuddy
+          CLIENT_INFO_PLATFORM: WorkBuddy
+          CLIENT_INFO_PRODUCT_NAME: WorkBuddy
+        run: |
+          cd quark_skill/scripts
+          node quark-drive.cjs get-user-info \
+            --session-input "机房可行性验证" --session-id "probe-1" \
+            --stdout-only 2>&1 | head -40
+          echo "退出码: $?"
