@@ -58,11 +58,15 @@ jobs:
           for it in items:
               print("  -", it.get("name"), "->", (it.get("url") or "")[:110])
           PYEOF
+          echo "--- runner 磁盘实况 ---"
+          df -h . | tail -1
+          python3 -c "import shutil;print('可用字节:', shutil.disk_usage('.').free)"
 
       - name: 2. 多线程 Range 下载
         run: |
           cat > dl.py <<'PYEOF'
           import base64, json, os, sys, threading, time, urllib.request
+          import shutil
 
           items = json.loads(base64.b64decode(os.environ["ITEMS_B64"]).decode("utf-8"))
           COOKIE = os.environ.get("COOKIE", "")
@@ -230,6 +234,18 @@ jobs:
               if total and total > HARD_MAX:
                   skipped.append("%s\t%d字节超磁盘上限" % (name, total))
                   continue
+              # ★ 下载前查【真实剩余磁盘】：不够就跳过这个文件，而不是硬下到一半
+              #   把盘撑爆、导致整批全废（前面下好的也一起没了）。
+              #   runner 可用磁盘约 14GB，留 2GB 余量给 node/CLI/临时文件。
+              try:
+                  _free = shutil.disk_usage(OUT).free
+              except Exception:
+                  _free = 0
+              if total and _free and (total + 2 * 1024 * 1024 * 1024) > _free:
+                  skipped.append("%s\t机房剩余磁盘不足(需%.1fGB剩%.1fGB)"
+                                 % (name, total / 1073741824.0, _free / 1073741824.0))
+                  print("  ::warning:: 磁盘不足，跳过 %s" % name, flush=True)
+                  continue
               path = os.path.join(OUT, name)
               if rng and total:
                   errs, el = parallel(u, ref, total, path)
@@ -295,6 +311,7 @@ jobs:
           done = r["done"]
           folder = os.environ.get("FOLDER") or "NIT"
           SCRIPTS = "quark_skill/scripts"
+          OUT = "out"
           ok, bad = [], []
 
           def cli(args, timeout=7200):
@@ -324,40 +341,127 @@ jobs:
 
           lock = threading.Lock()
 
+          # ★★ 大文件分卷（2026-10-22 实测逼出来的方案）★★
+          #   实测 run #5：440MB(110片) 上传成功；3.68GB(880片) 报
+          #   SocketTimeoutException: Read timed out；5.30GB(1295片) 报
+          #   ACK timeout for batch 940 (>60000ms)。
+          #   持久化里 partSize=4194304(4MB) ⇒ 失败都发生在【片数接近 900+】时。
+          #   ⇒ 夸克对「单次上传会话」有隐性上限（片数/时长），不是文件大小上限。
+          #   CLI 没有对外的 upload-resume 命令（源码里有但未注册）⇒ 无法续传。
+          #   正解：把大文件切成 500MB 的卷（125片，与已验证可用的 440MB 同量级）
+          #        分别上传，各卷独立成功；用户下载后本地 copy /b 合并。
+          #   注意：分卷不需要 GitHub Release（500MB < 2GiB 附件上限），
+          #        也不需要本地拉回 —— 仍是「机房直传夸克」。
+          SPLIT_THRESHOLD = 1024 * 1024 * 1024      # >1GB 才分卷
+          VOL_SIZE = 500 * 1024 * 1024              # 每卷 500MB
+
+          def _upload_file(path, name, parent_fid, tries=2):
+              """上传单个文件（可重试）。返回 (ok:bool, code, msg, sec, instant)"""
+              for attempt in range(tries):
+                  t0 = time.time()
+                  try:
+                      res = cli(["upload", os.path.abspath(path),
+                                 "--parent-fid", parent_fid])
+                  except subprocess.TimeoutExpired:
+                      if attempt < tries - 1:
+                          print("  ↻ 上传超时，重试 %s" % name, flush=True)
+                          continue
+                      return False, -1, "上传超时", time.time() - t0, False
+                  el = time.time() - t0
+                  code = res.get("code")
+                  if code == 0:
+                      return True, 0, "", el, bool((res.get("data") or {}).get("instantUpload"))
+                  msg = res.get("msg") or ("code=%s" % code)
+                  if attempt < tries - 1:
+                      print("  ↻ 上传失败(重试): %s : %s" % (name, msg), flush=True)
+                      time.sleep(5)
+                      continue
+                  return False, code, msg, el, False
+              return False, -1, "未知", 0.0, False
+
           def _up_one(it):
-              """单文件上传（在线程池里并发跑）。"""
+              """上传一个条目。小文件直传；超过阈值的切成 500MB 卷分别上传。"""
               name, path, sz = it["name"], it["path"], it["size"]
               t0 = time.time()
-              try:
-                  # ★ 必须传绝对路径：cli() 把 cwd 切到了 scripts/，相对路径会被
-                  #   解析成 scripts/out/xxx，CLI 报「文件不存在」（实测踩到）。
-                  res = cli(["upload", os.path.abspath(path), "--parent-fid", fid])
-              except subprocess.TimeoutExpired:
-                  with lock:
-                      bad.append({"name": name, "msg": "上传超时"})
-                  print("✗ 上传失败 %s : 上传超时" % name, flush=True)
+              if sz <= SPLIT_THRESHOLD:
+                  o, code, msg, el, instant = _upload_file(path, name, fid)
+                  if o:
+                      with lock:
+                          ok.append({"name": name, "size": sz,
+                                     "instant": instant, "sec": round(el, 1)})
+                      print("✓ 上传完成 %s  %d字节  用时 %.1fs  均速 %.2fMB/s%s"
+                            % (name, sz, el, sz / 1048576.0 / max(el, 1),
+                               "  [秒传]" if instant else ""), flush=True)
+                  else:
+                      with lock:
+                          bad.append({"name": name, "msg": msg})
+                      print("✗ 上传失败 %s : %s" % (name, msg), flush=True)
                   return
-              el = time.time() - t0
-              code = res.get("code")
-              d = res.get("data") or {}
-              instant = bool(d.get("instantUpload"))
-              if code == 0:
-                  with lock:
-                      ok.append({"name": name, "size": sz,
-                                 "instant": instant, "sec": round(el, 1)})
-                  print("✓ 上传完成 %s  %d字节  用时 %.1fs  均速 %.2fMB/s%s"
-                        % (name, sz, el, sz / 1048576.0 / max(el, 1),
-                           "  [秒传]" if instant else ""), flush=True)
-              else:
-                  with lock:
-                      bad.append({"name": name, "msg": res.get("msg") or ("code=%s" % code)})
-                  print("✗ 上传失败 %s : %s" % (name, res.get("msg")), flush=True)
 
-          # ★ 2026-10-22：并发上传（默认 3 路），加速多文件批次。
-          #   实测单文件上传受夸克单连接限速（~3.67MB/s），而机房下载有 18MB/s，
-          #   说明瓶颈在夸克【按连接】限速而非机房带宽 —— 并发多条各占一路、
-          #   总吞吐近似线性提升。单文件/空批次退化为串行（len<=1 不进线程池），
-          #   无副作用。并发上限 6，可用 env UPLOAD_WORKERS 调。
+              # ---- 大文件：分卷 ----
+              nvol = (sz + VOL_SIZE - 1) // VOL_SIZE
+              print("⚠ %s 有 %d 字节，超过夸克单次上传上限 → 切成 %d 个 500MB 卷分别上传"
+                    % (name, sz, nvol), flush=True)
+              # 每卷放进同名子文件夹，下载时一眼看得出哪几卷属于同一个文件
+              sub_res = cli(["create-folder", "--dir-path", name, "--parent-fid", fid])
+              sub_fid = ((sub_res.get("data") or {}).get("fid")
+                         or (sub_res.get("data") or {}).get("id") or fid)
+              parts, failed = [], []
+              with open(path, "rb") as f:
+                  for vi in range(nvol):
+                      pname = "%s.part%03d" % (name, vi + 1)
+                      ppath = os.path.join(OUT, pname)
+                      remain = min(VOL_SIZE, sz - vi * VOL_SIZE)
+                      with open(ppath, "wb") as pf:
+                          left = remain
+                          while left > 0:
+                              b = f.read(min(1 << 20, left))
+                              if not b:
+                                  break
+                              pf.write(b)
+                              left -= len(b)
+                      o, code, msg, el, instant = _upload_file(ppath, pname, sub_fid)
+                      if o:
+                          parts.append({"name": pname, "size": remain,
+                                        "sec": round(el, 1), "instant": instant})
+                          print("  ✓ %s  %d字节  用时 %.1fs  均速 %.2fMB/s"
+                                % (pname, remain, el,
+                                   remain / 1048576.0 / max(el, 1)), flush=True)
+                      else:
+                          failed.append({"name": pname, "msg": msg})
+                          print("  ✗ %s : %s" % (pname, msg), flush=True)
+                      # 传完立刻删这一卷，磁盘峰值 = 原文件 + 1 卷
+                      try:
+                          os.remove(ppath)
+                      except Exception:
+                          pass
+              # 原文件已切完，删掉释放磁盘（大文件批次靠这个不撑爆 runner）
+              try:
+                  os.remove(path)
+              except Exception:
+                  pass
+              el = time.time() - t0
+              with lock:
+                  if failed:
+                      bad.append({"name": name,
+                                  "msg": "分卷上传失败 %d/%d 卷：%s"
+                                         % (len(failed), nvol,
+                                            failed[0].get("msg"))})
+                  else:
+                      ok.append({"name": name, "size": sz, "instant": False,
+                                 "sec": round(el, 1), "parts": parts,
+                                 "vol_size": VOL_SIZE})
+              print(("✓ %s 分 %d 卷全部上传完成  用时 %.1fs" % (name, nvol, el))
+                    if not failed else
+                    ("✗ %s 分卷上传 %d/%d 卷成功" % (name, nvol - len(failed), nvol)),
+                    flush=True)
+
+          # ★ 2026-10-22：并发上传（默认 3 路）。
+          #   机房实测：3 个文件并发上传 8.74GB 用了 17.8 分钟（聚合 ~8.4MB/s），
+          #   明显快于单文件 3.67MB/s ⇒ 机房到夸克是【按连接】限速，并发有效。
+          #   （本机实测并发无收益，是因为本机上行本身只有 ~6MB/s，属另一回事。）
+          #   单文件/空批次退化为串行（len<=1 不进线程池），无副作用。
+          #   上限 6，可用 env UPLOAD_WORKERS 调。
           MAX_WORKERS = int(os.environ.get("UPLOAD_WORKERS") or 3)
           MAX_WORKERS = max(1, min(MAX_WORKERS, 6))
           if len(done) <= 1:
