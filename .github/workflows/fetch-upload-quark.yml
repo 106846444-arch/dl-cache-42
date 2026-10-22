@@ -288,7 +288,8 @@ jobs:
           FOLDER: ${{ inputs.folder }}
         run: |
           cat > up.py <<'PYEOF'
-          import json, os, subprocess, sys, time
+          import json, os, subprocess, sys, time, threading
+          import concurrent.futures as cf
 
           r = json.load(open("dl_result.json", encoding="utf-8"))
           done = r["done"]
@@ -321,7 +322,10 @@ jobs:
                  or (res.get("data") or {}).get("id") or "")
           print("目标目录 fid =", fid)
 
-          for it in done:
+          lock = threading.Lock()
+
+          def _up_one(it):
+              """单文件上传（在线程池里并发跑）。"""
               name, path, sz = it["name"], it["path"], it["size"]
               t0 = time.time()
               try:
@@ -329,21 +333,39 @@ jobs:
                   #   解析成 scripts/out/xxx，CLI 报「文件不存在」（实测踩到）。
                   res = cli(["upload", os.path.abspath(path), "--parent-fid", fid])
               except subprocess.TimeoutExpired:
-                  bad.append({"name": name, "msg": "上传超时"})
-                  continue
+                  with lock:
+                      bad.append({"name": name, "msg": "上传超时"})
+                  print("✗ 上传失败 %s : 上传超时" % name, flush=True)
+                  return
               el = time.time() - t0
               code = res.get("code")
               d = res.get("data") or {}
               instant = bool(d.get("instantUpload"))
               if code == 0:
-                  ok.append({"name": name, "size": sz,
-                             "instant": instant, "sec": round(el, 1)})
+                  with lock:
+                      ok.append({"name": name, "size": sz,
+                                 "instant": instant, "sec": round(el, 1)})
                   print("✓ 上传完成 %s  %d字节  用时 %.1fs  均速 %.2fMB/s%s"
                         % (name, sz, el, sz / 1048576.0 / max(el, 1),
                            "  [秒传]" if instant else ""), flush=True)
               else:
-                  bad.append({"name": name, "msg": res.get("msg") or ("code=%s" % code)})
+                  with lock:
+                      bad.append({"name": name, "msg": res.get("msg") or ("code=%s" % code)})
                   print("✗ 上传失败 %s : %s" % (name, res.get("msg")), flush=True)
+
+          # ★ 2026-10-22：并发上传（默认 3 路），加速多文件批次。
+          #   实测单文件上传受夸克单连接限速（~3.67MB/s），而机房下载有 18MB/s，
+          #   说明瓶颈在夸克【按连接】限速而非机房带宽 —— 并发多条各占一路、
+          #   总吞吐近似线性提升。单文件/空批次退化为串行（len<=1 不进线程池），
+          #   无副作用。并发上限 6，可用 env UPLOAD_WORKERS 调。
+          MAX_WORKERS = int(os.environ.get("UPLOAD_WORKERS") or 3)
+          MAX_WORKERS = max(1, min(MAX_WORKERS, 6))
+          if len(done) <= 1:
+              for it in done:
+                  _up_one(it)
+          else:
+              with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                  list(ex.map(_up_one, done))
 
           json.dump({"ok": ok, "bad": bad, "folder": folder},
                     open("up_result.json", "w", encoding="utf-8"))
