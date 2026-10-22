@@ -282,7 +282,9 @@ jobs:
               name, path, sz = it["name"], it["path"], it["size"]
               t0 = time.time()
               try:
-                  res = cli(["upload", path, "--parent-fid", fid])
+                  # ★ 必须传绝对路径：cli() 把 cwd 切到了 scripts/，相对路径会被
+                  #   解析成 scripts/out/xxx，CLI 报「文件不存在」（实测踩到）。
+                  res = cli(["upload", os.path.abspath(path), "--parent-fid", fid])
               except subprocess.TimeoutExpired:
                   bad.append({"name": name, "msg": "上传超时"})
                   continue
