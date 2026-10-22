@@ -1,0 +1,29 @@
+name: 回传速度探针（造 300MB 测试附件）
+
+# 一次性测速用：在机房造一个 300MB 不可压缩的测试文件并发布成 Release，
+# 然后在本地用 Range 实测「本地 ← GitHub Release」的回传速度。
+# 测完请手动删除该 Release（或让 purge-old-releases 兜底）。
+on:
+  workflow_dispatch:
+
+jobs:
+  make:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: 造 300MB 随机数据（不可压缩，模拟真实 zip）
+        run: |
+          head -c 314572800 /dev/urandom > speedtest-300m.bin
+          ls -lh speedtest-300m.bin
+          md5sum speedtest-300m.bin
+
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: speedtest-${{ github.run_number }}
+          name: 回传测速用（测完请删）
+          files: speedtest-300m.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
