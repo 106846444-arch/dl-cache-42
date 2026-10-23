@@ -55,7 +55,16 @@ jobs:
           touch quark_skill/workbuddy/_wtest && echo "workbuddy 可写 ✓" && rm -f quark_skill/workbuddy/_wtest
           echo "===== 4) get-user-info ====="
           cd quark_skill/scripts
-          CLIENT_INFO_IDE_TYPE=WorkBuddy node quark-drive.cjs get-user-info --session-input diag --session-id diag 2>&1 | tail -2
-          echo "===== 5) 跑完后 config 是否被改写（刷新痕迹） ====="
+          node quark-drive.cjs get-user-info --session-input diag --session-id diag 2>&1 | tail -1
+          echo "===== 5) create-folder 已存在的 UP @ root(0) ====="
+          node quark-drive.cjs create-folder --dir-path "UP" --parent-fid "0" --session-input diag --session-id diag 2>&1 | tail -1
+          echo "===== 6) create-folder 全新随机名 @ root(0) ====="
+          node quark-drive.cjs create-folder --dir-path "_probe_$(date +%H%M%S)" --parent-fid "0" --session-input diag --session-id diag 2>&1 | tail -1
+          echo "===== 7) 连打 3 次 UP（看是否稳定 1007） ====="
+          for i in 1 2 3; do
+            node quark-drive.cjs create-folder --dir-path "UP" --parent-fid "0" --session-input diag --session-id "d$i" 2>&1 | tail -1
+            sleep 3
+          done
+          echo "===== 8) 跑完后 config 是否被改写（刷新痕迹） ====="
           cd - >/dev/null
           sha256sum quark_skill/workbuddy/config.json
