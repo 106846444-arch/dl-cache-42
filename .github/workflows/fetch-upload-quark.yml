@@ -305,6 +305,7 @@ jobs:
         run: |
           cat > up.py <<'PYEOF'
           import json, os, subprocess, sys, time, threading
+          import queue
           import concurrent.futures as cf
 
           r = json.load(open("dl_result.json", encoding="utf-8"))
@@ -348,23 +349,37 @@ jobs:
                  or (res.get("data") or {}).get("id") or "")
           print("目标目录 fid =", fid)
 
-          lock = threading.Lock()
-
-          # ★★ 大文件分卷（2026-10-22 实测逼出来的方案）★★
-          #   实测 run #5：440MB(110片) 上传成功；3.68GB(880片) 报
-          #   SocketTimeoutException: Read timed out；5.30GB(1295片) 报
-          #   ACK timeout for batch 940 (>60000ms)。
-          #   持久化里 partSize=4194304(4MB) ⇒ 失败都发生在【片数接近 900+】时。
-          #   ⇒ 夸克对「单次上传会话」有隐性上限（片数/时长），不是文件大小上限。
-          #   CLI 没有对外的 upload-resume 命令（源码里有但未注册）⇒ 无法续传。
-          #   正解：把大文件切成 500MB 的卷（125片，与已验证可用的 440MB 同量级）
-          #        分别上传，各卷独立成功；用户下载后本地 copy /b 合并。
-          #   注意：分卷不需要 GitHub Release（500MB < 2GiB 附件上限），
-          #        也不需要本地拉回 —— 仍是「机房直传夸克」。
-          #   策略：>1GB 直接分卷（整传必浪费十几分钟）；≤1GB 先整传，
-          #        整传失败再降级分卷（440MB 这种能整传的保持整传，不用用户合并）。
+          # ★★ 上传并发：按【卷】并行，不是按文件（2026-10-23 改造）★★
+          #
+          # 2026-10-22 第一版并发是 ex.map(_up_one, done)——按【文件】提交线程池。
+          # 坑：大文件内部的 N 个卷是在同一个 worker 里【串行】传的。
+          #   run #9 实测：3 文件 8.74GB，10 卷的 L0120.zip 串行链 ≈ 22 分钟，
+          #   另外两个 worker 早早闲置 ⇒ 整体被最长卷链锁死，聚合带宽上不去。
+          #
+          # 2026-10-23 改法：生产者线程串行「决策 + 切卷」，每个卷/整文件作为
+          #   独立任务塞进【有界队列】，MAX_WORKERS 个消费者线程并行上传。
+          #   · 磁盘峰值 = 全部原文件 + (W+2) 个卷（队列有界，切卷不能无限超前）
+          #   · 卷传完立刻删，原文件切完即删
+          #   · 并发度终于等于卷数而不是文件数：17 卷 / 6 路 ≈ 3 轮
+          #
+          # 速率依据（机房→夸克）：
+          #   单文件整传实测 3.67MB/s（440MB/120s，run #4）；
+          #   3 文件并发（按文件提交）聚合 ~8.4MB/s（run #5）⇒ 按连接限速，并发有效。
+          #   默认 6 路（env UPLOAD_WORKERS 可调，clamp 1~6）。
+          #
+          # 分卷依据（2026-10-22 实测）：夸克对【单次上传会话】有隐性上限
+          #   （440MB/110片成功；3.68GB/880片 SocketTimeout；5.30GB/1295片 ACK timeout）
+          #   ⇒ >1000MB 切 500MB 卷；≤1000MB 先整传，失败降级分卷。
+          #   CLI 有 upload resume（--record-id）可续传、也有秒传（hash 命中即完成），
+          #   但卷只有 500MB，重试重传代价可接受，暂不接 resume。
           SPLIT_THRESHOLD = 1000 * 1024 * 1024       # >1000MB 直接分卷
           VOL_SIZE = 500 * 1024 * 1024              # 每卷 500MB
+# 并发度：默认 4（可用仓库变量 UPLOAD_WORKERS 覆盖，上限 6）。
+# ★ 取 4 的依据：单路上传实测 3.67MB/s，但【聚合】带宽有上限 ——
+#   2026-10-22 run #5（3 路）聚合 8.4MB/s，已明显低于 3×3.67=11MB/s，
+#   说明再多开收益递减、却更容易撞夸克 ACK 超时。4 是提速与稳定的折中。
+MAX_WORKERS = int(os.environ.get("UPLOAD_WORKERS") or 4)
+MAX_WORKERS = max(1, min(MAX_WORKERS, 6))
 
           def _upload_file(path, name, parent_fid, tries=2):
               """上传单个文件（可重试）。返回 (ok, code, msg, sec, instant)"""
@@ -390,101 +405,206 @@ jobs:
                   return False, code, msg, el, False
               return False, -1, "未知", 0.0, False
 
-          def _split_upload(name, path, sz):
-              """把大文件切成 500MB 的卷分别上传。返回 (parts, failed)"""
+          # ---- 按原始文件收集结果（消费者线程并发写，加锁）----
+          results = {}
+          results_lock = threading.Lock()
+
+          def _res(name, sz):
+              with results_lock:
+                  r = results.get(name)
+                  if r is None:
+                      r = results[name] = {"size": sz, "parts": [], "failed": [],
+                                           "t0": time.time()}
+                  return r
+
+          def _cut_one(f, name, vi, sz):
+              """切第 vi 卷（0 起）落盘，返回 (ppath, remain)。"""
+              pname = "%s.part%03d" % (name, vi + 1)
+              ppath = os.path.join(OUT, pname)
+              remain = min(VOL_SIZE, sz - vi * VOL_SIZE)
+              with open(ppath, "wb") as pf:
+                  left = remain
+                  while left > 0:
+                      b = f.read(min(1 << 20, left))
+                      if not b:
+                          break
+                      pf.write(b)
+                      left -= len(b)
+              return ppath, remain
+
+          def _sub_folder(name):
+              """给分卷文件建同名子文件夹（幂等，带重试），返回 fid。"""
+              res = cli(["create-folder", "--dir-path", name, "--parent-fid", fid])
+              return ((res.get("data") or {}).get("fid")
+                      or (res.get("data") or {}).get("id") or fid)
+
+          def _split_serial(name, path, sz):
+              """降级路径：整传失败后在调用线程内串行切+传（磁盘峰值 = 文件+1卷）。"""
               nvol = (sz + VOL_SIZE - 1) // VOL_SIZE
-              print("⚠ %s 有 %d 字节 → 切成 %d 个 500MB 卷分别上传"
-                    % (name, sz, nvol), flush=True)
-              # 每卷放进同名子文件夹，下载时一眼看得出哪几卷属于同一个文件
-              sub_res = cli(["create-folder", "--dir-path", name, "--parent-fid", fid])
-              sub_fid = ((sub_res.get("data") or {}).get("fid")
-                         or (sub_res.get("data") or {}).get("id") or fid)
-              parts, failed = [], []
+              print("⚠ %s 降级分卷：切成 %d 个 500MB 卷分别上传" % (name, nvol), flush=True)
+              sub_fid = _sub_folder(name)
               with open(path, "rb") as f:
                   for vi in range(nvol):
                       pname = "%s.part%03d" % (name, vi + 1)
-                      ppath = os.path.join(OUT, pname)
-                      remain = min(VOL_SIZE, sz - vi * VOL_SIZE)
-                      with open(ppath, "wb") as pf:
-                          left = remain
-                          while left > 0:
-                              b = f.read(min(1 << 20, left))
-                              if not b:
-                                  break
-                              pf.write(b)
-                              left -= len(b)
+                      ppath, remain = _cut_one(f, name, vi, sz)
                       o, code, msg, el, instant = _upload_file(ppath, pname, sub_fid)
-                      if o:
-                          parts.append({"name": pname, "size": remain,
-                                        "sec": round(el, 1), "instant": instant})
-                          print("  ✓ %s  %d字节  用时 %.1fs  均速 %.2fMB/s"
-                                % (pname, remain, el,
-                                   remain / 1048576.0 / max(el, 1)), flush=True)
-                      else:
-                          failed.append({"name": pname, "msg": msg})
-                          print("  ✗ %s : %s" % (pname, msg), flush=True)
-                      # 传完立刻删这一卷，磁盘峰值 = 原文件 + 1 卷
+                      with results_lock:
+                          r = results.setdefault(name, {"size": sz, "parts": [],
+                                                        "failed": [], "t0": time.time()})
+                          if o:
+                              r["parts"].append({"name": pname, "size": remain,
+                                                 "sec": round(el, 1),
+                                                 "instant": instant})
+                          else:
+                              r["failed"].append({"name": pname, "msg": msg})
+                      print(("  ✓ %s  %d字节  用时 %.1fs  均速 %.2fMB/s"
+                             % (pname, remain, el,
+                                remain / 1048576.0 / max(el, 1)))
+                            if o else ("  ✗ %s : %s" % (pname, msg)), flush=True)
                       try:
                           os.remove(ppath)
                       except Exception:
                           pass
-              # 原文件已切完，删掉释放磁盘（大文件批次靠这个不撑爆 runner）
               try:
                   os.remove(path)
               except Exception:
                   pass
-              return parts, failed
 
-          def _up_one(it):
-              """上传一个条目：能整传就整传，超过阈值或整传失败就分卷。"""
-              name, path, sz = it["name"], it["path"], it["size"]
-              t0 = time.time()
-              parts = None
-              if sz > SPLIT_THRESHOLD:
-                  parts, failed = _split_upload(name, path, sz)
-              else:
-                  o, code, msg, el, instant = _upload_file(path, name, fid)
+          task_q = queue.Queue(maxsize=MAX_WORKERS + 2)
+          _DONE = object()
+
+          def _producer():
+              """串行决策 + 切卷入队。整文件也走队列（小文件可与大文件的卷并行）。"""
+              try:
+                  for it in done:
+                      name, path, sz = it["name"], it["path"], it["size"]
+                      if sz > SPLIT_THRESHOLD:
+                          nvol = (sz + VOL_SIZE - 1) // VOL_SIZE
+                          print("⚠ %s 有 %d 字节 → 切成 %d 个 500MB 卷分别上传"
+                                % (name, sz, nvol), flush=True)
+                          sub_fid = _sub_folder(name)
+                          with open(path, "rb") as f:
+                              for vi in range(nvol):
+                                  ppath, remain = _cut_one(f, name, vi, sz)
+                                  task_q.put({"kind": "vol", "path": ppath,
+                                              "name": "%s.part%03d" % (name, vi + 1),
+                                              "fid": sub_fid, "orig": name,
+                                              "size": sz, "vsize": remain})
+                          try:
+                              os.remove(path)   # 原文件已全部切成卷
+                          except Exception:
+                              pass
+                      else:
+                          task_q.put({"kind": "whole", "path": path,
+                                      "name": name, "fid": fid,
+                                      "orig": name, "size": sz})
+              except Exception as e:
+                  print("::error::切卷/入队线程异常: %s" % e, flush=True)
+                  with results_lock:
+                      for it in done:
+                          nm, sz = it["name"], it["size"]
+                          r = results.get(nm)
+                          if r is None:
+                              results[nm] = {"size": sz, "parts": [], "failed":
+                                             [{"name": nm, "msg":
+                                               "切卷阶段异常: %s" % e}],
+                                             "t0": time.time()}
+                          elif not r.get("whole"):
+                              need = (sz + VOL_SIZE - 1) // VOL_SIZE
+                              miss = need - len(r["parts"]) - len(r["failed"])
+                              for _i in range(max(0, miss)):
+                                  r["failed"].append({"name": nm,
+                                                      "msg": "切卷未完成: %s" % e})
+              finally:
+                  task_q.put(_DONE)
+
+          def _handle(t):
+              if t["kind"] == "whole":
+                  o, code, msg, el, instant = _upload_file(t["path"], t["name"], t["fid"])
                   if o:
-                      with lock:
-                          ok.append({"name": name, "size": sz,
-                                     "instant": instant, "sec": round(el, 1)})
+                      with results_lock:
+                          results[t["orig"]] = {"size": t["size"], "parts": [],
+                                                "failed": [], "whole": True,
+                                                "instant": instant,
+                                                "sec": round(el, 1)}
                       print("✓ 上传完成 %s  %d字节  用时 %.1fs  均速 %.2fMB/s%s"
-                            % (name, sz, el, sz / 1048576.0 / max(el, 1),
+                            % (t["name"], t["size"], el,
+                               t["size"] / 1048576.0 / max(el, 1),
                                "  [秒传]" if instant else ""), flush=True)
                       return
                   # 整传失败 → 降级分卷再试一次（常见于会话片数到上限）
-                  print("  ↻ 整文件上传失败，降级为分卷上传: %s" % name, flush=True)
-                  parts, failed = _split_upload(name, path, sz)
-              el = time.time() - t0
-              with lock:
-                  if failed:
-                      bad.append({"name": name,
-                                  "msg": "分卷上传失败 %d/%d 卷：%s"
-                                         % (len(failed), len(parts) + len(failed),
-                                            failed[0].get("msg"))})
-                  else:
-                      ok.append({"name": name, "size": sz, "instant": False,
-                                 "sec": round(el, 1), "parts": parts,
-                                 "vol_size": VOL_SIZE})
-              print(("✓ %s 分 %d 卷全部上传完成  用时 %.1fs" % (name, len(parts), el))
-                    if not failed else
-                    ("✗ %s 分卷上传 %d/%d 卷成功" % (name, len(parts), len(parts) + len(failed))),
-                    flush=True)
+                  print("  ↻ 整文件上传失败，降级为分卷上传: %s" % t["name"], flush=True)
+                  _split_serial(t["orig"], t["path"], t["size"])
+                  return
+              o, code, msg, el, instant = _upload_file(t["path"], t["name"], t["fid"])
+              # ★ 2026-10-23 修死锁：_res() 自己会拿 results_lock，
+              #   外面再套一层 `with results_lock` 就是【同一把不可重入锁】
+              #   二次获取 → 每个卷上传完立刻自我死锁（本地桩测试抓到）。
+              r = _res(t["orig"], t["size"])
+              if o:
+                  r["parts"].append({"name": t["name"], "size": t["vsize"],
+                                     "sec": round(el, 1), "instant": instant})
+              else:
+                  r["failed"].append({"name": t["name"], "msg": msg})
+              print(("  ✓ %s  %d字节  用时 %.1fs  均速 %.2fMB/s"
+                     % (t["name"], t["vsize"], el,
+                        t["vsize"] / 1048576.0 / max(el, 1)))
+                    if o else ("  ✗ %s : %s" % (t["name"], msg)), flush=True)
+              try:
+                  os.remove(t["path"])   # 传完立刻删卷释放磁盘
+              except Exception:
+                  pass
 
-          # ★ 2026-10-22：并发上传（默认 3 路）。
-          #   机房实测：3 个文件并发上传 8.74GB 用了 17.8 分钟（聚合 ~8.4MB/s），
-          #   明显快于单文件 3.67MB/s ⇒ 机房到夸克是【按连接】限速，并发有效。
-          #   （本机实测并发无收益，是因为本机上行本身只有 ~6MB/s，属另一回事。）
-          #   单文件/空批次退化为串行（len<=1 不进线程池），无副作用。
-          #   上限 6，可用 env UPLOAD_WORKERS 调。
-          MAX_WORKERS = int(os.environ.get("UPLOAD_WORKERS") or 3)
-          MAX_WORKERS = max(1, min(MAX_WORKERS, 6))
-          if len(done) <= 1:
-              for it in done:
-                  _up_one(it)
-          else:
-              with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-                  list(ex.map(_up_one, done))
+          def _consumer():
+              while True:
+                  t = task_q.get()
+                  if t is _DONE:
+                      break            # ★ 不再转发哨兵：转发会让 put 撞上
+                                       #   maxsize 而阻塞（队列满时死锁）
+                  try:
+                      _handle(t)
+                  except Exception as e:
+                      print("  ✗ 任务处理异常 %s: %s" % (t.get("name"), e), flush=True)
+                      r = _res(t["orig"], t["size"])
+                      r["failed"].append({"name": t["name"], "msg": str(e)})
+                  finally:
+                      task_q.task_done()
+
+          prod = threading.Thread(target=_producer, daemon=True)
+          prod.start()
+          cons = [threading.Thread(target=_consumer, daemon=True)
+                  for _ in range(MAX_WORKERS)]
+          for c in cons:
+              c.start()
+          prod.join()
+          # 每个消费者各发一个结束哨兵（主线程发，不阻塞消费者）
+          for _c in cons:
+              task_q.put(_DONE)
+          for c in cons:
+              c.join()
+
+          # ---- 汇总（ok/bad JSON 格式与旧版一致，软件侧照旧解析）----
+          for name, r in results.items():
+              if r.get("whole"):
+                  ok.append({"name": name, "size": r["size"],
+                             "instant": r.get("instant"), "sec": r.get("sec")})
+              elif r["failed"]:
+                  bad.append({"name": name,
+                              "msg": "分卷上传失败 %d/%d 卷：%s"
+                                     % (len(r["failed"]),
+                                        len(r["parts"]) + len(r["failed"]),
+                                        r["failed"][0].get("msg"))})
+                  print("✗ %s 分卷上传 %d/%d 卷成功"
+                        % (name, len(r["parts"]),
+                           len(r["parts"]) + len(r["failed"])), flush=True)
+              else:
+                  ok.append({"name": name, "size": r["size"], "instant": False,
+                             "sec": round(time.time() - r["t0"], 1),
+                             "parts": sorted(r["parts"], key=lambda p: p["name"]),
+                             "vol_size": VOL_SIZE})
+                  print("✓ %s 分 %d 卷全部上传完成  用时 %.1fs"
+                        % (name, len(r["parts"]), time.time() - r["t0"]), flush=True)
+
 
           json.dump({"ok": ok, "bad": bad, "folder": folder},
                     open("up_result.json", "w", encoding="utf-8"))
