@@ -6,6 +6,11 @@ on:
 jobs:
   diag:
     runs-on: ubuntu-latest
+    env:
+      QUARK_AUTH_JSON: ${{ secrets.QUARK_AUTH_JSON }}
+      CLIENT_INFO_IDE_TYPE: WorkBuddy
+      CLIENT_INFO_PLATFORM: WorkBuddy
+      CLIENT_INFO_PRODUCT_NAME: WorkBuddy
     steps:
       - name: 装 CLI 并落授权
         run: |
