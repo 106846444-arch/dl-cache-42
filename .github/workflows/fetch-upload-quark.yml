@@ -624,10 +624,25 @@ MAX_WORKERS = max(1, min(MAX_WORKERS, 6))
           #   Secret 的值本身就是一段 JSON，GitHub 会把【出现在 Secret 里的标点】
           #   在日志里打码成 ***（实测 { } [ ] 全变成 ***），软件根本没法解析。
           #   base64 字符集里没有这些符号，不会被 mask。
+          #
+          # ★★ 2026-10-23 再修：base64 仍会被打码，但只在【结尾是 "==" 填充】时！
+          #   查了 5 次真实 run：
+          #     b64 156/188/440 字符，末尾 0~1 个 '='  → 完整、能解析
+          #     b64 551/2795 字符，末尾 '=='           → 结尾 4 个字符被换成 ***
+          #                                              → json.loads 报
+          #                                              "Expecting ',' delimiter"
+          #   于是软件只读到 0 字节结果、误判失败（真机 L0120 就是这样）。
+          #   修法：把 JSON 补空格到 3 字节整数倍，base64 就【不会有任何 '=' 填充】，
+          #   绕开打码。收尾多出来的空格由 json.loads 自然忽略。
+          def _b64_nopad(d):
+              raw = json.dumps(d, ensure_ascii=False).encode("utf-8")
+              while len(raw) % 3:
+                  raw += b" "
+              return base64.b64encode(raw).decode("ascii")
+
           for f in ("dl_result.json", "up_result.json"):
               if not os.path.exists(f):
                   continue
               d = json.load(open(f, encoding="utf-8"))
-              print("RESULT_B64 %s %s" % (f, base64.b64encode(
-                  json.dumps(d, ensure_ascii=False).encode("utf-8")).decode("ascii")))
+              print("RESULT_B64 %s %s" % (f, _b64_nopad(d)))
           PYEOF
