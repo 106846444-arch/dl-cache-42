@@ -374,12 +374,12 @@ jobs:
           #   但卷只有 500MB，重试重传代价可接受，暂不接 resume。
           SPLIT_THRESHOLD = 1000 * 1024 * 1024       # >1000MB 直接分卷
           VOL_SIZE = 500 * 1024 * 1024              # 每卷 500MB
-# 并发度：默认 4（可用仓库变量 UPLOAD_WORKERS 覆盖，上限 6）。
-# ★ 取 4 的依据：单路上传实测 3.67MB/s，但【聚合】带宽有上限 ——
-#   2026-10-22 run #5（3 路）聚合 8.4MB/s，已明显低于 3×3.67=11MB/s，
-#   说明再多开收益递减、却更容易撞夸克 ACK 超时。4 是提速与稳定的折中。
-MAX_WORKERS = int(os.environ.get("UPLOAD_WORKERS") or 4)
-MAX_WORKERS = max(1, min(MAX_WORKERS, 6))
+          # 并发度：默认 4（可用仓库变量 UPLOAD_WORKERS 覆盖，上限 6）。
+          # ★ 取 4 的依据：单路上传实测 3.67MB/s，但【聚合】带宽有上限 ——
+          #   2026-10-22 run #5（3 路）聚合 8.4MB/s，已明显低于 3×3.67=11MB/s，
+          #   说明再多开收益递减、却更容易撞夸克 ACK 超时。4 是提速与稳定的折中。
+          MAX_WORKERS = int(os.environ.get("UPLOAD_WORKERS") or 4)
+          MAX_WORKERS = max(1, min(MAX_WORKERS, 6))
 
           def _upload_file(path, name, parent_fid, tries=2):
               """上传单个文件（可重试）。返回 (ok, code, msg, sec, instant)"""
