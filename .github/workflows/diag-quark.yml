@@ -1,0 +1,55 @@
+name: 临时诊断-夸克凭证与建目录
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 装 CLI 并落授权
+        run: |
+          mkdir -p qs
+          curl -sL --retry 2 --connect-timeout 20 -o qs/q.zip \
+            "https://pdds.quark.cn/download/stfile/kkqqltosqklokmsmf/quarkclouddrive-1.0.12.zip"
+          unzip -q qs/q.zip -d qs/unz
+          CLI=$(find qs/unz -name "quark-drive.cjs" | head -1)
+          SDIR=$(dirname "$CLI")
+          mkdir -p quark_skill/scripts quark_skill/workbuddy
+          cp -r "$SDIR"/* quark_skill/scripts/ 2>/dev/null || true
+          printf '%s' "$QUARK_AUTH_JSON" > quark_skill/workbuddy/config.json
+          echo "CLI 就位，凭证 $(wc -c < quark_skill/workbuddy/config.json) 字节"
+          echo "node 版本: $(node --version)"
+
+      - name: 诊断（授权 / 建目录 / 网络）
+        env:
+          CLIENT_INFO_IDE_TYPE: WorkBuddy
+          CLIENT_INFO_PLATFORM: WorkBuddy
+          CLIENT_INFO_PRODUCT_NAME: WorkBuddy
+        run: |
+          cd quark_skill/scripts
+          echo "===== 1) get-user-info ====="
+          node quark-drive.cjs get-user-info --session-input diag --session-id diag 2>&1 | tail -2
+          echo "===== 2) create-folder UP @ root(0) ====="
+          node quark-drive.cjs create-folder --dir-path "UP" --parent-fid "0" --session-input diag --session-id diag 2>&1 | tail -2
+          echo "===== 3) create-folder NIT @ root(0) ====="
+          node quark-drive.cjs create-folder --dir-path "NIT" --parent-fid "0" --session-input diag --session-id diag 2>&1 | tail -2
+          echo "===== 4) 网络：member 接口 ====="
+          curl -s -o /dev/null -w "member HTTP %{http_code} (%{time_total}s)\n" \
+            "https://drive-pc.quark.cn/1/clouddrive/member?pr=ucpro&fr=pc&uc_param_str=" || echo "member 请求失败"
+          echo "===== 5) 凭证文件摘要（不打印内容） ====="
+          python3 - <<'PYEOF'
+          import json
+          d = json.load(open("quark_skill/workbuddy/config.json", encoding="utf-8"))
+          keys = sorted(d.keys())
+          print("顶层键:", keys)
+          for k in keys:
+              v = d[k]
+              if isinstance(v, dict):
+                  print(" ", k, "子键:", sorted(v.keys()))
+          for k in ("login_time", "update_time"):
+              for kk, vv in d.items():
+                  if isinstance(vv, dict) and k in vv:
+                      print(" ", kk, k, "=", vv[k])
+          print("字节数:", len(open("quark_skill/workbuddy/config.json","rb").read()))
+          PYEOF
