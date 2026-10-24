@@ -45,14 +45,15 @@ jobs:
           mkdir -p /tmp/diag
           for i in 1 2 3; do
             echo "===== 样本 $i/3：生成 450MB 随机文件（随机内容=不会秒传） ====="
-            dd if=/dev/urandom of=/tmp/diag/t$i.bin bs=1M count=450 status=none
-            SZ=$(stat -c %s /tmp/diag/t$i.bin)
+            FN="/tmp/diag/t$i-$GITHUB_RUN_ID.bin"
+            dd if=/dev/urandom of="$FN" bs=1M count=450 status=none
+            SZ=$(stat -c %s "$FN")
             echo "文件大小: $SZ 字节"
             for att in 1 2 3; do
               echo "--- 样本 $i 第 $att 次尝试  开始 $(date -u +%H:%M:%S) ---"
               T0=$(date +%s)
-              node quark-drive.cjs upload /tmp/diag/t$i.bin --parent-fid "$FID" > /tmp/diag/out.jsonl 2>&1
-              EC=$?
+              EC=0
+              node quark-drive.cjs upload "$FN" --parent-fid "$FID" > /tmp/diag/out.jsonl 2>&1 || EC=$?
               T1=$(date +%s)
               echo "exit=$EC  耗时 $((T1-T0))s  结束 $(date -u +%H:%M:%S)"
               echo "--- CLI 输出（剔除 progress 行） ---"
@@ -63,6 +64,6 @@ jobs:
               fi
               echo ">>> 样本 $i 第 $att 次尝试失败"
             done
-            rm -f /tmp/diag/t$i.bin
+            rm -f "$FN"
           done
           echo "===== 诊断完成（文件留在 _diag_ack，稍后手工清理） ====="
