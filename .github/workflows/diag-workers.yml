@@ -54,7 +54,7 @@ jobs:
           WORKERS = int(os.environ.get("UPLOAD_WORKERS") or "4")
           SCRIPTS = "quark_skill/scripts"
 
-          def cli(args, timeout=7200):
+          def cli(args, timeout=900):
               cmd = ["node", "quark-drive.cjs"] + args + [
                   "--session-input", "诊断", "--session-id", "diag-workers"]
               p = subprocess.run(cmd, capture_output=True, text=True,
@@ -119,7 +119,11 @@ jobs:
           cons = [threading.Thread(target=worker, daemon=True) for _ in range(WORKERS)]
           for c in cons:
               c.start()
-          tasks.put(DONE)
+          # ★ 2026-10-24 修：每个消费者一个哨兵。只放 1 个 DONE 时，
+          #   先拿到它的消费者 break，其余消费者处理完任务后永远阻塞在
+          #   tasks.get()，join() 卡死（实测段A 卡 18 分钟，文件其实传完了）。
+          for _ in range(WORKERS):
+              tasks.put(DONE)
           for c in cons:
               c.join()
           total_el = time.time() - t_start
