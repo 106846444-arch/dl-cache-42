@@ -43,27 +43,46 @@ jobs:
           print(fid)" | head -1)
           echo "目标目录 fid: $FID"
           mkdir -p /tmp/diag
-          for i in 1 2 3; do
-            echo "===== 样本 $i/3：生成 450MB 随机文件（随机内容=不会秒传） ====="
-            FN="/tmp/diag/t$i-$GITHUB_RUN_ID.bin"
+          echo "########## 段 A：串行 2 个样本（基线） ##########"
+          for i in 1 2; do
+            echo "===== 串行样本 $i/2：生成 450MB 随机文件 ====="
+            FN="/tmp/diag/s$i-$GITHUB_RUN_ID.bin"
             dd if=/dev/urandom of="$FN" bs=1M count=450 status=none
             SZ=$(stat -c %s "$FN")
             echo "文件大小: $SZ 字节"
             for att in 1 2 3; do
-              echo "--- 样本 $i 第 $att 次尝试  开始 $(date -u +%H:%M:%S) ---"
+              echo "--- 串行样本 $i 第 $att 次尝试  开始 $(date -u +%H:%M:%S) ---"
               T0=$(date +%s)
               EC=0
-              node quark-drive.cjs upload "$FN" --parent-fid "$FID" > /tmp/diag/out.jsonl 2>&1 || EC=$?
+              node quark-drive.cjs upload "$FN" --parent-fid "$FID" > /tmp/diag/out_s$i.jsonl 2>&1 || EC=$?
               T1=$(date +%s)
               echo "exit=$EC  耗时 $((T1-T0))s  结束 $(date -u +%H:%M:%S)"
-              echo "--- CLI 输出（剔除 progress 行） ---"
-              grep -v '"type":"progress"' /tmp/diag/out.jsonl || cat /tmp/diag/out.jsonl
+              grep -v '"type":"progress"' /tmp/diag/out_s$i.jsonl || cat /tmp/diag/out_s$i.jsonl
               if [ "$EC" -eq 0 ]; then
-                echo ">>> 样本 $i 第 $att 次尝试成功"
+                echo ">>> 串行样本 $i 第 $att 次尝试成功"
                 break
               fi
-              echo ">>> 样本 $i 第 $att 次尝试失败"
+              echo ">>> 串行样本 $i 第 $att 次尝试失败"
             done
             rm -f "$FN"
+          done
+          echo "########## 段 B：并行 4 个样本（模拟 MAX_WORKERS=4） ##########"
+          for i in 1 2 3 4; do
+            (
+              FN="/tmp/diag/p$i-$GITHUB_RUN_ID.bin"
+              dd if=/dev/urandom of="$FN" bs=1M count=450 status=none
+              T0=$(date +%s)
+              EC=0
+              node quark-drive.cjs upload "$FN" --parent-fid "$FID" > /tmp/diag/out_p$i.jsonl 2>&1 || EC=$?
+              T1=$(date +%s)
+              echo "--- 并行样本 $i：exit=$EC  耗时 $((T1-T0))s ---" > /tmp/diag/res_p$i.txt
+              rm -f "$FN"
+            ) &
+          done
+          wait
+          for i in 1 2 3 4; do
+            echo "===== 并行样本 $i 结果 ====="
+            cat /tmp/diag/res_p$i.txt 2>/dev/null || echo "(无结果)"
+            grep -v '"type":"progress"' /tmp/diag/out_p$i.jsonl 2>/dev/null || cat /tmp/diag/out_p$i.jsonl 2>/dev/null
           done
           echo "===== 诊断完成（文件留在 _diag_ack，稍后手工清理） ====="
