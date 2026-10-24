@@ -419,6 +419,16 @@ jobs:
           #   说明再多开收益递减、却更容易撞夸克 ACK 超时。4 是提速与稳定的折中。
           MAX_WORKERS = int(os.environ.get("UPLOAD_WORKERS") or 4)
           MAX_WORKERS = max(1, min(MAX_WORKERS, 6))
+          # ★ 2026-10-24 重试策略（run #27 实证，11 卷里 4 卷失败）：
+          #   9 次失败签名拆开看——batch 0 秒挂 ×3、API 调用超时 ×3、
+          #   服务器内部异常 ×1，都【与卷大小无关】；只有 1 次是中会话死
+          #   （batch 99/125）。⇒ 不把卷切更小（4.9GB÷250MB=21 卷，
+          #   upload_pre 之类 API 调用翻倍，反而放大失败面），而是：
+          #   · 分卷重试 2→3 次（run #27 里 9 个首尝失败有 5 个二遍就成了）
+          #   · 原文件保留到整文件成功，之后只【补传失败的卷】
+          #     （7/11 成功时不用重下 4.9GB，只补 4 卷；run #27 白重下了一整遍）
+          SPLIT_TRIES = 3          # 分卷上传重试次数（整传仍为 2）
+          BACKFILL_ROUNDS = 2      # 缺卷补传轮数
 
           def _upload_file(path, name, parent_fid, tries=2):
               """上传单个文件（可重试）。返回 (ok, code, msg, sec, instant)"""
@@ -486,7 +496,8 @@ jobs:
                   for vi in range(nvol):
                       pname = "%s.part%03d" % (name, vi + 1)
                       ppath, remain = _cut_one(f, name, vi, sz)
-                      o, code, msg, el, instant = _upload_file(ppath, pname, sub_fid)
+                      o, code, msg, el, instant = _upload_file(ppath, pname, sub_fid,
+                                                               tries=SPLIT_TRIES)
                       with results_lock:
                           r = results.setdefault(name, {"size": sz, "parts": [],
                                                         "failed": [], "t0": time.time()})
@@ -511,6 +522,8 @@ jobs:
 
           task_q = queue.Queue(maxsize=MAX_WORKERS + 2)
           _DONE = object()
+          # ★ 2026-10-24：分卷文件的【原文件保留到整文件成功】，缺卷补传要靠它重切
+          sub_fids, orig_keep, nvol_map = {}, {}, {}
 
           def _producer():
               """串行决策 + 切卷入队。整文件也走队列（小文件可与大文件的卷并行）。"""
@@ -522,6 +535,11 @@ jobs:
                           print("⚠ %s 有 %d 字节 → 切成 %d 个 500MB 卷分别上传"
                                 % (name, sz, nvol), flush=True)
                           sub_fid = _sub_folder(name)
+                          sub_fids[name] = sub_fid
+                          orig_keep[name] = path   # ★ 保留原文件，供缺卷补传重切
+                          nvol_map[name] = nvol
+                          # ★ 2026-10-24：不再删原文件（旧写法切完即删，
+                          #   有卷失败时只能整文件重来——run #27 白重下 4.9GB）
                           with open(path, "rb") as f:
                               for vi in range(nvol):
                                   ppath, remain = _cut_one(f, name, vi, sz)
@@ -529,10 +547,6 @@ jobs:
                                               "name": "%s.part%03d" % (name, vi + 1),
                                               "fid": sub_fid, "orig": name,
                                               "size": sz, "vsize": remain})
-                          try:
-                              os.remove(path)   # 原文件已全部切成卷
-                          except Exception:
-                              pass
                       else:
                           task_q.put({"kind": "whole", "path": path,
                                       "name": name, "fid": fid,
@@ -575,7 +589,8 @@ jobs:
                   print("  ↻ 整文件上传失败，降级为分卷上传: %s" % t["name"], flush=True)
                   _split_serial(t["orig"], t["path"], t["size"])
                   return
-              o, code, msg, el, instant = _upload_file(t["path"], t["name"], t["fid"])
+              o, code, msg, el, instant = _upload_file(t["path"], t["name"], t["fid"],
+                                                       tries=SPLIT_TRIES)
               # ★ 2026-10-23 修死锁：_res() 自己会拿 results_lock，
               #   外面再套一层 `with results_lock` 就是【同一把不可重入锁】
               #   二次获取 → 每个卷上传完立刻自我死锁（本地桩测试抓到）。
@@ -621,6 +636,82 @@ jobs:
               task_q.put(_DONE)
           for c in cons:
               c.join()
+
+          # ★ 2026-10-24 缺卷补传：并行 pass 完后，把仍失败的卷从保留的原文件里
+          #   重切出来单独重传（串行，磁盘峰值 = 原文件 + 1 卷）。
+          #   run #27 实证：11 卷 7 成 4 败——补 4 卷 vs 重下 4.9GB 整包。
+          #   注意只补【失败】的卷：成功的卷不重传（内容多半已被服务端收下，
+          #   重传也常是秒传，但没必要赌）。
+          def _backfill_round():
+              for name, r in list(results.items()):
+                  if not r.get("failed") or name not in orig_keep:
+                      continue
+                  path = orig_keep[name]
+                  sz = r["size"]
+                  nvol = nvol_map.get(name) or 0
+                  sub_fid = sub_fids.get(name) or fid
+                  done_names = {p.get("name") for p in (r.get("parts") or [])}
+                  print("↻ 补传 %s：缺 %d 卷（%s）"
+                        % (name, len(r["failed"]),
+                           ", ".join(sorted(x.get("name", "?") for x in r["failed"]))),
+                        flush=True)
+                  with open(path, "rb") as f:
+                      for vi in range(nvol):
+                          pname = "%s.part%03d" % (name, vi + 1)
+                          if pname in done_names:
+                              continue
+                          remain = min(VOL_SIZE, sz - vi * VOL_SIZE)
+                          if remain <= 0:
+                              continue
+                          f.seek(vi * VOL_SIZE)
+                          ppath = os.path.join(OUT, pname)
+                          left = remain
+                          with open(ppath, "wb") as pf:
+                              while left > 0:
+                                  b = f.read(min(1 << 20, left))
+                                  if not b:
+                                      break
+                                  pf.write(b)
+                                  left -= len(b)
+                          o, code, msg, el, instant = _upload_file(
+                              ppath, pname, sub_fid, tries=SPLIT_TRIES)
+                          if o:
+                              r["parts"].append({"name": pname, "size": remain,
+                                                 "sec": round(el, 1),
+                                                 "instant": instant})
+                              r["failed"] = [x for x in r["failed"]
+                                             if x.get("name") != pname]
+                              print("  ✓ 补传成功 %s（%.1fs）" % (pname, el), flush=True)
+                          else:
+                              for x in r["failed"]:
+                                  if x.get("name") == pname:
+                                      x["msg"] = msg
+                              print("  ✗ 补传仍失败 %s : %s" % (pname, msg), flush=True)
+                          try:
+                              os.remove(ppath)
+                          except Exception:
+                              pass
+                  if not r["failed"]:
+                      try:
+                          os.remove(path)
+                      except Exception:
+                          pass
+                      orig_keep.pop(name, None)
+
+          for _rnd in range(BACKFILL_ROUNDS):
+              if not any(rr.get("failed") for rr in results.values()):
+                  break
+              print("---- 缺卷补传第 %d/%d 轮 ----" % (_rnd + 1, BACKFILL_ROUNDS),
+                    flush=True)
+              _backfill_round()
+
+          # 收尾：剩余原文件一律删掉（机房容器即弃，留着只是占盘）
+          for _nm, _pth in list(orig_keep.items()):
+              try:
+                  os.remove(_pth)
+              except Exception:
+                  pass
+          orig_keep.clear()
 
           # ---- 汇总（ok/bad JSON 格式与旧版一致，软件侧照旧解析）----
           for name, r in results.items():
