@@ -1,10 +1,11 @@
 name: 诊断-上传并发对照
 
-# ★ 一次性诊断（2026-10-24 20:10）：测「上传并发 4 vs 6」的真实聚合吞吐。
-#   背景：单会话限速 ~3.3MB/s（20+ 个 500MB 卷全部 143~158s 实证），
-#   现网 4 路卷并行。run #30+#31 意外并行（8 会话）时每卷不降速 ⇒ 疑有空间，
-#   但缺同条件对照，故跑本诊断：两段各 8 个随机文件（防秒传），只差 W。
-#   用法：跑完读日志两个「段汇总」JSON，删 _diag_w4/_diag_w6 后 DELETE 本文件。
+# ★ 一次性诊断（2026-10-24 20:50 第二轮）：第一轮 4 vs 6 实证 6 路聚合 +70%，
+#   但 run #30+#31 意外并行（8 会话）聚合只 ~16.8MB/s ≈ 6 路水平 ⇒ 疑撞
+#   ~17MB/s 账户级/runner 出口天花板。本轮三段对照 6/8/10，每段 10 个随机
+#   文件（防秒传；W=10 也填得满），只差 UPLOAD_WORKERS。
+#   看三个指标：agg_mbps（聚合）、单文件均速（掉没掉速）、fail（1007 拒绝）。
+#   用法：跑完读日志三个「段汇总」JSON，删 _diag_w6/_diag_w8/_diag_w10 后 DELETE 本文件。
 
 on:
   workflow_dispatch:
@@ -12,7 +13,7 @@ on:
 jobs:
   diag:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     env:
       QUARK_AUTH_JSON: ${{ secrets.QUARK_AUTH_JSON }}
@@ -140,28 +141,33 @@ jobs:
           }, ensure_ascii=False), flush=True)
           PYEOF
           python3 -m py_compile diag_up.py && echo "诊断脚本编译 OK"
-          mkdir -p t4 t6
-          for i in 1 2 3 4 5 6; do
-            dd if=/dev/urandom of=t4/big$i.bin bs=1M count=300 status=none
-            dd if=/dev/urandom of=t6/big$i.bin bs=1M count=300 status=none
+          mkdir -p t6 t8 t10
+          for d in t6 t8 t10; do
+            for i in 1 2 3 4 5 6 7 8; do
+              dd if=/dev/urandom of=$d/big$i.bin bs=1M count=300 status=none
+            done
+            for i in 1 2; do
+              dd if=/dev/urandom of=$d/small$i.bin bs=1M count=8 status=none
+            done
           done
-          for i in 1 2; do
-            dd if=/dev/urandom of=t4/small$i.bin bs=1M count=8 status=none
-            dd if=/dev/urandom of=t6/small$i.bin bs=1M count=8 status=none
-          done
-          du -sh t4 t6; df -h . | tail -1
+          du -sh t6 t8 t10; df -h . | tail -1
 
-      - name: 3. 段A：4 并发（对照组）
-        env:
-          UPLOAD_WORKERS: "4"
-        run: python3 diag_up.py _diag_w4 t4
-
-      - name: 4. 段B：6 并发（实验组）
+      - name: 3. 段A：6 并发（基线，对齐第一轮）
         env:
           UPLOAD_WORKERS: "6"
         run: python3 diag_up.py _diag_w6 t6
 
-      - name: 5. 完成
+      - name: 4. 段B：8 并发（实验组1）
+        env:
+          UPLOAD_WORKERS: "8"
+        run: python3 diag_up.py _diag_w8 t8
+
+      - name: 5. 段C：10 并发（实验组2）
+        env:
+          UPLOAD_WORKERS: "10"
+        run: python3 diag_up.py _diag_w10 t10
+
+      - name: 6. 完成
         run: |
-          echo "诊断完成。回本机读两个「段汇总」JSON 对比 agg_mbps / total_sec。"
-          echo "清理提醒：删 _diag_w4 / _diag_w6 后 DELETE 本 workflow。"
+          echo "诊断完成。回本机读三个「段汇总」JSON 对比 agg_mbps / total_sec / 单文件均速。"
+          echo "清理提醒：删 _diag_w6 / _diag_w8 / _diag_w10 后 DELETE 本 workflow。"
