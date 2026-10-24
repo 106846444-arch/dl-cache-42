@@ -49,6 +49,13 @@ jobs:
       HARD_MAX_BYTES: 12884901888
 
     steps:
+      # ★ 2026-10-24：必须检出仓库 —— 第 3 步要优先用仓库内置的 CLI 副本
+      #   （vendor/quark_skill/），不再依赖 pdds.quark.cn 这个跨境不稳定的 CDN。
+      #   实测（run #18，2026-10-24 12:07）：机房 curl 该 CDN 三次连接全部超时
+      #   （exit code 28），整个第 3 步挂掉、后面上传全跳过，白跑 60 秒。
+      - name: 0. 检出仓库（内置 CLI 副本）
+        uses: actions/checkout@v4
+
       - name: 1. 解析任务清单
         run: |
           python3 - <<'PYEOF'
@@ -288,16 +295,32 @@ jobs:
           CLIENT_INFO_PLATFORM: WorkBuddy
           CLIENT_INFO_PRODUCT_NAME: WorkBuddy
         run: |
-          mkdir -p qs
-          curl -sL --retry 2 --connect-timeout 20 -o qs/q.zip \
-            "https://pdds.quark.cn/download/stfile/kkqqltosqklokmsmf/quarkclouddrive-1.0.12.zip"
-          unzip -q qs/q.zip -d qs/unz
-          CLI=$(find qs/unz -name "quark-drive.cjs" | head -1)
-          SDIR=$(dirname "$CLI")
-          mkdir -p quark_skill/scripts quark_skill/workbuddy
-          cp -r "$SDIR"/* quark_skill/scripts/ 2>/dev/null || true
+          # ★ 2026-10-24：CLI 来源改为「仓库内置副本优先，CDN 兜底」。
+          #   原写法只从 pdds.quark.cn 下载，机房跨境网络到该 CDN 间歇性超时
+          #   （run #18 实测 curl exit 28，-s 静默模式下连报错都看不到，
+          #   整个第 3 步 63 秒无输出后挂掉，后面上传全跳过）。
+          #   现在仓库里带了纯净版 quark_skill（vendor/，无凭证），checkout
+          #   之后直接可用；CDN 只在内置副本缺失时才走，且重试参数加强。
+          if [ -f vendor/quark_skill/scripts/quark-drive.cjs ]; then
+            mkdir -p quark_skill
+            cp -r vendor/quark_skill/* quark_skill/
+            echo "CLI 就位，来源：仓库内置副本（不依赖外网 CDN）"
+          else
+            echo "仓库无内置副本，回退 CDN 下载（重试参数已加强）..."
+            mkdir -p qs
+            curl --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -L \
+              -o qs/q.zip \
+              "https://pdds.quark.cn/download/stfile/kkqqltosqklokmsmf/quarkclouddrive-1.0.12.zip"
+            unzip -q qs/q.zip -d qs/unz
+            CLI=$(find qs/unz -name "quark-drive.cjs" | head -1)
+            SDIR=$(dirname "$CLI")
+            mkdir -p quark_skill/scripts quark_skill/workbuddy
+            cp -r "$SDIR"/* quark_skill/scripts/ 2>/dev/null || true
+            echo "CLI 就位，来源：CDN 下载（兜底）"
+          fi
+          mkdir -p quark_skill/workbuddy
           printf '%s' "$QUARK_AUTH_JSON" > quark_skill/workbuddy/config.json
-          echo "CLI 就位，凭证 $(wc -c < quark_skill/workbuddy/config.json) 字节"
+          echo "凭证 $(wc -c < quark_skill/workbuddy/config.json) 字节"
           echo "--- 校验夸克登录态 ---"
           INFO=$(cd quark_skill/scripts && node quark-drive.cjs get-user-info --session-input "登录校验" --session-id "gh-auth" 2>&1 | tail -1)
           echo "$INFO"
