@@ -291,7 +291,8 @@ jobs:
                   continue
               # ★ 下载前查【真实剩余磁盘】：不够就跳过这个文件，而不是硬下到一半
               #   把盘撑爆、导致整批全废（前面下好的也一起没了）。
-              #   runner 可用磁盘约 14GB，留 2GB 余量给 node/CLI/临时文件。
+              #   2026-10-24 更正：实测可用 86GB（早前记的 14GB 是错的），
+              #   留 2GB 余量给 node/CLI/临时文件；整批另有 40GB 上限兜底。
               try:
                   _free = shutil.disk_usage(OUT).free
               except Exception:
