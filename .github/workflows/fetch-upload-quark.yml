@@ -69,7 +69,55 @@ jobs:
           df -h . | tail -1
           python3 -c "import shutil;print('可用字节:', shutil.disk_usage('.').free)"
 
-      - name: 2. 多线程 Range 下载
+      - name: 2. 装夸克 CLI 并落授权
+        # ★ 2026-10-24：本步骤移到下载之前。机房出口 IP 被夸克风控时
+        #   （实测 code:-100，westus3 等 region）必须秒失败，不能让机房
+        #   先把十几个 G 下完再死（run #24 实测白下 11 分钟才报错）。
+        # ★ 凭证必须走 env 传：JSON 里全是双引号，直接在 bash 里 ${{ }} 展开
+        #   会破坏引号配对（实测写入被截断、JSON 解析失败）。
+        env:
+          QUARK_AUTH_JSON: ${{ secrets.QUARK_AUTH_JSON }}
+          CLIENT_INFO_IDE_TYPE: WorkBuddy
+          CLIENT_INFO_PLATFORM: WorkBuddy
+          CLIENT_INFO_PRODUCT_NAME: WorkBuddy
+        run: |
+          # ★ 2026-10-24：CLI 来源改为「仓库内置副本优先，CDN 兜底」。
+          #   原写法只从 pdds.quark.cn 下载，机房跨境网络到该 CDN 间歇性超时
+          #   （run #18 实测 curl exit 28，-s 静默模式下连报错都看不到，
+          #   整个第 3 步 63 秒无输出后挂掉，后面上传全跳过）。
+          #   现在仓库里带了纯净版 quark_skill（vendor/，无凭证），checkout
+          #   之后直接可用；CDN 只在内置副本缺失时才走，且重试参数加强。
+          if [ -f vendor/quark_skill/scripts/quark-drive.cjs ]; then
+            mkdir -p quark_skill
+            cp -r vendor/quark_skill/* quark_skill/
+            echo "CLI 就位，来源：仓库内置副本（不依赖外网 CDN）"
+          else
+            echo "仓库无内置副本，回退 CDN 下载（重试参数已加强）..."
+            mkdir -p qs
+            curl --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -L \
+              -o qs/q.zip \
+              "https://pdds.quark.cn/download/stfile/kkqqltosqklokmsmf/quarkclouddrive-1.0.12.zip"
+            unzip -q qs/q.zip -d qs/unz
+            CLI=$(find qs/unz -name "quark-drive.cjs" | head -1)
+            SDIR=$(dirname "$CLI")
+            mkdir -p quark_skill/scripts quark_skill/workbuddy
+            cp -r "$SDIR"/* quark_skill/scripts/ 2>/dev/null || true
+            echo "CLI 就位，来源：CDN 下载（兜底）"
+          fi
+          mkdir -p quark_skill/workbuddy
+          printf '%s' "$QUARK_AUTH_JSON" > quark_skill/workbuddy/config.json
+          echo "凭证 $(wc -c < quark_skill/workbuddy/config.json) 字节"
+          echo "--- 校验夸克登录态 ---"
+          INFO=$(cd quark_skill/scripts && node quark-drive.cjs get-user-info --session-input "登录校验" --session-id "gh-auth" 2>&1 | tail -1)
+          echo "$INFO"
+          if ! echo "$INFO" | grep -q '"code":0'; then
+            echo "::error::夸克授权失败：$INFO"
+            echo "::error::code:-100 多为机房出口 IP 被风控（换台机房即好，软件会自动重派）；多台机房都报同错才是凭证失效，才需更新 Secret"
+            exit 1
+          fi
+          echo "夸克登录态 OK"
+
+      - name: 3. 多线程 Range 下载
         run: |
           cat > dl.py <<'PYEOF'
           import base64, json, os, sys, threading, time, urllib.request
@@ -285,51 +333,6 @@ jobs:
               sys.exit(1)
           PYEOF
           python3 dl.py
-
-      - name: 3. 装夸克 CLI 并落授权
-        # ★ 凭证必须走 env 传：JSON 里全是双引号，直接在 bash 里 ${{ }} 展开
-        #   会破坏引号配对（实测写入被截断、JSON 解析失败）。
-        env:
-          QUARK_AUTH_JSON: ${{ secrets.QUARK_AUTH_JSON }}
-          CLIENT_INFO_IDE_TYPE: WorkBuddy
-          CLIENT_INFO_PLATFORM: WorkBuddy
-          CLIENT_INFO_PRODUCT_NAME: WorkBuddy
-        run: |
-          # ★ 2026-10-24：CLI 来源改为「仓库内置副本优先，CDN 兜底」。
-          #   原写法只从 pdds.quark.cn 下载，机房跨境网络到该 CDN 间歇性超时
-          #   （run #18 实测 curl exit 28，-s 静默模式下连报错都看不到，
-          #   整个第 3 步 63 秒无输出后挂掉，后面上传全跳过）。
-          #   现在仓库里带了纯净版 quark_skill（vendor/，无凭证），checkout
-          #   之后直接可用；CDN 只在内置副本缺失时才走，且重试参数加强。
-          if [ -f vendor/quark_skill/scripts/quark-drive.cjs ]; then
-            mkdir -p quark_skill
-            cp -r vendor/quark_skill/* quark_skill/
-            echo "CLI 就位，来源：仓库内置副本（不依赖外网 CDN）"
-          else
-            echo "仓库无内置副本，回退 CDN 下载（重试参数已加强）..."
-            mkdir -p qs
-            curl --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -L \
-              -o qs/q.zip \
-              "https://pdds.quark.cn/download/stfile/kkqqltosqklokmsmf/quarkclouddrive-1.0.12.zip"
-            unzip -q qs/q.zip -d qs/unz
-            CLI=$(find qs/unz -name "quark-drive.cjs" | head -1)
-            SDIR=$(dirname "$CLI")
-            mkdir -p quark_skill/scripts quark_skill/workbuddy
-            cp -r "$SDIR"/* quark_skill/scripts/ 2>/dev/null || true
-            echo "CLI 就位，来源：CDN 下载（兜底）"
-          fi
-          mkdir -p quark_skill/workbuddy
-          printf '%s' "$QUARK_AUTH_JSON" > quark_skill/workbuddy/config.json
-          echo "凭证 $(wc -c < quark_skill/workbuddy/config.json) 字节"
-          echo "--- 校验夸克登录态 ---"
-          INFO=$(cd quark_skill/scripts && node quark-drive.cjs get-user-info --session-input "登录校验" --session-id "gh-auth" 2>&1 | tail -1)
-          echo "$INFO"
-          if ! echo "$INFO" | grep -q '"code":0'; then
-            echo "::error::夸克未登录或凭证失效：$INFO"
-            echo "::error::请用本地最新 quark_skill/workbuddy/config.json 更新仓库 Secret QUARK_AUTH_JSON"
-            exit 1
-          fi
-          echo "夸克登录态 OK"
 
       - name: 4. 上传夸克
         env:
