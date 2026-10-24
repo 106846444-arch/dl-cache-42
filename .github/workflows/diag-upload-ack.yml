@@ -1,0 +1,68 @@
+name: diag-upload-ack
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    env:
+      QUARK_AUTH_JSON: ${{ secrets.QUARK_AUTH_JSON }}
+      CLIENT_INFO_IDE_TYPE: WorkBuddy
+      CLIENT_INFO_PLATFORM: WorkBuddy
+      CLIENT_INFO_PRODUCT_NAME: WorkBuddy
+    steps:
+      - name: 0. 检出仓库（内置 CLI 副本）
+        uses: actions/checkout@v4
+
+      - name: 1. 装 CLI 并落授权
+        run: |
+          mkdir -p quark_skill
+          cp -r vendor/quark_skill/* quark_skill/
+          mkdir -p quark_skill/workbuddy
+          printf '%s' "$QUARK_AUTH_JSON" > quark_skill/workbuddy/config.json
+          echo "CLI 就位，凭证 $(wc -c < quark_skill/workbuddy/config.json) 字节"
+
+      - name: 2. 上传 ACK 诊断
+        run: |
+          echo "===== 机房信息（出口 IP 归属） ====="
+          curl -s -m 10 https://ipinfo.io/json || echo "(ipinfo 不可用)"
+          echo "node: $(node --version)"
+          cd quark_skill/scripts
+          echo "===== 建临时目录 _diag_ack（幂等） ====="
+          FID=$(node quark-drive.cjs create-folder --dir-path "_diag_ack" --parent-fid "0" | python3 -c "import sys,json
+          fid=''
+          for l in sys.stdin:
+              try:
+                  d=json.loads(l)
+              except Exception:
+                  continue
+              if d.get('code')==0:
+                  fid=(d.get('data') or {}).get('fid') or ''
+                  break
+          print(fid)" | head -1)
+          echo "目标目录 fid: $FID"
+          mkdir -p /tmp/diag
+          for i in 1 2 3; do
+            echo "===== 样本 $i/3：生成 450MB 随机文件（随机内容=不会秒传） ====="
+            dd if=/dev/urandom of=/tmp/diag/t$i.bin bs=1M count=450 status=none
+            SZ=$(stat -c %s /tmp/diag/t$i.bin)
+            echo "文件大小: $SZ 字节"
+            for att in 1 2 3; do
+              echo "--- 样本 $i 第 $att 次尝试  开始 $(date -u +%H:%M:%S) ---"
+              T0=$(date +%s)
+              node quark-drive.cjs upload /tmp/diag/t$i.bin --parent-fid "$FID" > /tmp/diag/out.jsonl 2>&1
+              EC=$?
+              T1=$(date +%s)
+              echo "exit=$EC  耗时 $((T1-T0))s  结束 $(date -u +%H:%M:%S)"
+              echo "--- CLI 输出（剔除 progress 行） ---"
+              grep -v '"type":"progress"' /tmp/diag/out.jsonl || cat /tmp/diag/out.jsonl
+              if [ "$EC" -eq 0 ]; then
+                echo ">>> 样本 $i 第 $att 次尝试成功"
+                break
+              fi
+              echo ">>> 样本 $i 第 $att 次尝试失败"
+            done
+            rm -f /tmp/diag/t$i.bin
+          done
+          echo "===== 诊断完成（文件留在 _diag_ack，稍后手工清理） ====="
