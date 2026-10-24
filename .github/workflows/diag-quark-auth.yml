@@ -1,0 +1,47 @@
+name: diag-quark-auth
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: 装 CLI 并落授权（带诊断）
+        env:
+          QUARK_AUTH_JSON: ${{ secrets.QUARK_AUTH_JSON }}
+          CLIENT_INFO_IDE_TYPE: WorkBuddy
+          CLIENT_INFO_PLATFORM: WorkBuddy
+          CLIENT_INFO_PRODUCT_NAME: WorkBuddy
+        run: |
+          echo "=== 环境信息 ==="
+          node --version || echo "node 不存在"
+          which node
+          npm --version 2>/dev/null || echo "(无 npm)"
+          echo "HOME=$HOME"
+          echo "PWD=$(pwd)"
+          echo
+          echo "=== CLI 就位（仓库副本）==="
+          mkdir -p quark_skill
+          cp -r vendor/quark_skill/* quark_skill/
+          mkdir -p quark_skill/workbuddy
+          printf '%s' "$QUARK_AUTH_JSON" > quark_skill/workbuddy/config.json
+          echo "config.json 字节: $(wc -c < quark_skill/workbuddy/config.json)"
+          echo "config.json md5: $(md5sum quark_skill/workbuddy/config.json | cut -d' ' -f1)"
+          echo "config.json 前120字符: $(head -c 120 quark_skill/workbuddy/config.json)"
+          echo
+          echo "=== 网络到夸克 API ==="
+          curl -s -o /dev/null -w "api-drive.quark.cn HTTP %{http_code} 连接 %{time_connect}s 总 %{time_total}s\n" --connect-timeout 10 --max-time 20 https://api-drive.quark.cn/ || echo "(curl 失败 $?)"
+          echo
+          echo "=== 跑 CLI（完整输出，不截断）==="
+          cd quark_skill/scripts
+          node quark-drive.cjs get-user-info --session-input "登录校验" --session-id "gh-auth" 2>&1
+          echo "CLI 退出码: $?"
+          echo
+          echo "=== config.json 跑完后是否被刷新（mtime/md5）==="
+          ls -la ../workbuddy/config.json
+          md5sum ../workbuddy/config.json
