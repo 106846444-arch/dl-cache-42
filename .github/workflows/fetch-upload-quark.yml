@@ -120,7 +120,7 @@ jobs:
       - name: 3. 多线程 Range 下载
         run: |
           cat > dl.py <<'PYEOF'
-          import base64, json, os, sys, threading, time, urllib.request
+          import base64, hashlib, json, os, sys, threading, time, urllib.request
           import shutil
 
           items = json.loads(base64.b64decode(os.environ["ITEMS_B64"]).decode("utf-8"))
@@ -328,7 +328,14 @@ jobs:
                                  % (name, total / 1073741824.0, _free / 1073741824.0))
                   print("  ::warning:: 磁盘不足，跳过 %s" % name, flush=True)
                   continue
-              path = os.path.join(OUT, name)
+              # ★ 2026-10-26 同名冲突修复：用 URL 的 md5 前 8 位做唯一 key，
+              #   下载落到 out/<key>/<name> 子目录 —— 两个【同名不同源】链接
+              #   再也不会互相覆盖（run #33 实证：MR-KR1963.mp4 两个源都下到
+              #   out/MR-KR1963.mp4，后者覆盖前者→上传端抢文件 part 缺失失败）。
+              #   path 全链路唯一，results 字典/云端子目录也靠它区分。
+              key = hashlib.md5(u.encode("utf-8")).hexdigest()[:8]
+              path = os.path.join(OUT, key, name)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
               # ★ 2026-10-25 流水化：先落 .part 再原子改名 ——
               #   上传端(up.py)跟着这条流边下边传，不改名它可能读到写了一半的文件。
               tmp = path + ".part"
@@ -678,18 +685,22 @@ jobs:
           results = {}
           results_lock = threading.Lock()
 
-          def _res(name, sz):
+          def _res(cpath, sz):
+              """results 字典用【唯一 path】做 key（不再用 name），同名文件互不覆盖。"""
               with results_lock:
-                  r = results.get(name)
+                  r = results.get(cpath)
                   if r is None:
-                      r = results[name] = {"size": sz, "parts": [], "failed": [],
-                                           "t0": time.time()}
+                      r = results[cpath] = {"size": sz, "parts": [], "failed": [],
+                                            "t0": time.time()}
                   return r
 
-          def _cut_one(f, name, vi, sz):
-              """切第 vi 卷（0 起）落盘，返回 (ppath, remain)。"""
+          def _cut_one(f, path, name, vi, sz):
+              """切第 vi 卷（0 起）落盘，返回 (ppath, remain)。
+              ★ 2026-10-26 唯一化：part 文件直接挂【唯一 path】后面
+              （out/<key>/<name>.partNNN），不再用 name 拼 OUT 目录，
+              两个同名任务的卷互不覆盖。pname 仍用原 name（云端文件名不变）。"""
               pname = "%s.part%03d" % (name, vi + 1)
-              ppath = os.path.join(OUT, pname)
+              ppath = "%s.part%03d" % (path, vi + 1)
               remain = min(VOL_SIZE, sz - vi * VOL_SIZE)
               with open(ppath, "wb") as pf:
                   left = remain
@@ -701,25 +712,33 @@ jobs:
                       left -= len(b)
               return ppath, remain
 
-          def _sub_folder(name):
-              """给分卷文件建同名子文件夹（幂等，带重试），返回 fid。"""
-              res = cli(["create-folder", "--dir-path", name, "--parent-fid", fid])
+          def _sub_folder(path):
+              """给分卷文件建子文件夹（幂等，带重试），返回 fid。
+              ★ 2026-10-26 唯一化：目录名用 key__name（key 从 path 反推），
+              两个同名任务云端各自独立目录，part 不再同名冲突。"""
+              name = os.path.basename(path)
+              key = os.path.basename(os.path.dirname(path))
+              dir_path = "%s__%s" % (key, name)
+              res = cli(["create-folder", "--dir-path", dir_path, "--parent-fid", fid])
               return ((res.get("data") or {}).get("fid")
                       or (res.get("data") or {}).get("id") or fid)
 
-          def _split_serial(name, path, sz):
-              """降级路径：整传失败后在调用线程内串行切+传（磁盘峰值 = 文件+1卷）。"""
+          def _split_serial(cpath, path, sz):
+              """降级路径：整传失败后在调用线程内串行切+传（磁盘峰值 = 文件+1卷）。
+              ★ 2026-10-26：第一参数改名 cpath（唯一 path），results/sub_fids/
+              orig_keep 全用 cpath 做 key，display 名用 basename。"""
+              nm = os.path.basename(cpath)
               nvol = (sz + VOL_SIZE - 1) // VOL_SIZE
-              print("⚠ %s 降级分卷：切成 %d 个 500MB 卷分别上传" % (name, nvol), flush=True)
-              sub_fid = _sub_folder(name)
+              print("⚠ %s 降级分卷：切成 %d 个 500MB 卷分别上传" % (nm, nvol), flush=True)
+              sub_fid = _sub_folder(cpath)
               with open(path, "rb") as f:
                   for vi in range(nvol):
-                      pname = "%s.part%03d" % (name, vi + 1)
-                      ppath, remain = _cut_one(f, name, vi, sz)
+                      pname = "%s.part%03d" % (nm, vi + 1)
+                      ppath, remain = _cut_one(f, path, nm, vi, sz)
                       o, code, msg, el, instant = _upload_file(ppath, pname, sub_fid,
                                                                tries=SPLIT_TRIES)
                       with results_lock:
-                          r = results.setdefault(name, {"size": sz, "parts": [],
+                          r = results.setdefault(cpath, {"size": sz, "parts": [],
                                                         "failed": [], "t0": time.time()})
                           if o:
                               r["parts"].append({"name": pname, "size": remain,
@@ -746,7 +765,8 @@ jobs:
           sub_fids, orig_keep, nvol_map = {}, {}, {}
 
           def _producer():
-              """串行决策 + 切卷入队。整文件也走队列（小文件可与大文件的卷并行）。"""
+              """串行决策 + 切卷入队。整文件也走队列（小文件可与大文件的卷并行）。
+              ★ 2026-10-26：全链路用唯一 path 做标识（同名文件不再互相覆盖）。"""
               try:
                   for it in done:
                       name, path, sz = it["name"], it["path"], it["size"]
@@ -754,23 +774,23 @@ jobs:
                           nvol = (sz + VOL_SIZE - 1) // VOL_SIZE
                           print("⚠ %s 有 %d 字节 → 切成 %d 个 500MB 卷分别上传"
                                 % (name, sz, nvol), flush=True)
-                          sub_fid = _sub_folder(name)
-                          sub_fids[name] = sub_fid
-                          orig_keep[name] = path   # ★ 保留原文件，供缺卷补传重切
-                          nvol_map[name] = nvol
+                          sub_fid = _sub_folder(path)
+                          sub_fids[path] = sub_fid
+                          orig_keep[path] = path   # ★ 保留原文件，供缺卷补传重切
+                          nvol_map[path] = nvol
                           # ★ 2026-10-24：不再删原文件（旧写法切完即删，
                           #   有卷失败时只能整文件重来——run #27 白重下 4.9GB）
                           with open(path, "rb") as f:
                               for vi in range(nvol):
-                                  ppath, remain = _cut_one(f, name, vi, sz)
+                                  ppath, remain = _cut_one(f, path, name, vi, sz)
                                   task_q.put({"kind": "vol", "path": ppath,
                                               "name": "%s.part%03d" % (name, vi + 1),
-                                              "fid": sub_fid, "orig": name,
+                                              "fid": sub_fid, "orig": path,
                                               "size": sz, "vsize": remain})
                       else:
                           task_q.put({"kind": "whole", "path": path,
                                       "name": name, "fid": fid,
-                                      "orig": name, "size": sz})
+                                      "orig": path, "size": sz})
               except Exception as e:
                   print("::error::切卷/入队线程异常: %s" % e, flush=True)
                   with results_lock:
@@ -778,18 +798,18 @@ jobs:
                       #   在这里再遍历它会【继续消费下载流】→ 下载端还在跑的话
                       #   这段异常处理会一直等下去（死等）。_done_seen 是已取走的快照。
                       for it in _done_seen:
-                          nm, sz = it["name"], it["size"]
-                          r = results.get(nm)
+                          cpath, sz = it["path"], it["size"]
+                          r = results.get(cpath)
                           if r is None:
-                              results[nm] = {"size": sz, "parts": [], "failed":
-                                             [{"name": nm, "msg":
-                                               "切卷阶段异常: %s" % e}],
-                                             "t0": time.time()}
+                              results[cpath] = {"size": sz, "parts": [], "failed":
+                                                [{"name": os.path.basename(cpath),
+                                                  "msg": "切卷阶段异常: %s" % e}],
+                                                "t0": time.time()}
                           elif not r.get("whole"):
                               need = (sz + VOL_SIZE - 1) // VOL_SIZE
                               miss = need - len(r["parts"]) - len(r["failed"])
                               for _i in range(max(0, miss)):
-                                  r["failed"].append({"name": nm,
+                                  r["failed"].append({"name": os.path.basename(cpath),
                                                       "msg": "切卷未完成: %s" % e})
               finally:
                   task_q.put(_DONE)
@@ -866,28 +886,29 @@ jobs:
           #   注意只补【失败】的卷：成功的卷不重传（内容多半已被服务端收下，
           #   重传也常是秒传，但没必要赌）。
           def _backfill_round():
-              for name, r in list(results.items()):
-                  if not r.get("failed") or name not in orig_keep:
+              for cpath, r in list(results.items()):
+                  if not r.get("failed") or cpath not in orig_keep:
                       continue
-                  path = orig_keep[name]
+                  path = orig_keep[cpath]
                   sz = r["size"]
-                  nvol = nvol_map.get(name) or 0
-                  sub_fid = sub_fids.get(name) or fid
+                  nvol = nvol_map.get(cpath) or 0
+                  sub_fid = sub_fids.get(cpath) or fid
+                  nm = os.path.basename(cpath)
                   done_names = {p.get("name") for p in (r.get("parts") or [])}
                   print("↻ 补传 %s：缺 %d 卷（%s）"
-                        % (name, len(r["failed"]),
+                        % (nm, len(r["failed"]),
                            ", ".join(sorted(x.get("name", "?") for x in r["failed"]))),
                         flush=True)
                   with open(path, "rb") as f:
                       for vi in range(nvol):
-                          pname = "%s.part%03d" % (name, vi + 1)
+                          pname = "%s.part%03d" % (nm, vi + 1)
                           if pname in done_names:
                               continue
                           remain = min(VOL_SIZE, sz - vi * VOL_SIZE)
                           if remain <= 0:
                               continue
                           f.seek(vi * VOL_SIZE)
-                          ppath = os.path.join(OUT, pname)
+                          ppath = "%s.part%03d" % (path, vi + 1)
                           left = remain
                           with open(ppath, "wb") as pf:
                               while left > 0:
@@ -937,7 +958,9 @@ jobs:
           orig_keep.clear()
 
           # ---- 汇总（ok/bad JSON 格式与旧版一致，软件侧照旧解析）----
-          for name, r in results.items():
+          # ★ 2026-10-26：results key 是唯一 path，输出 name 用 basename（原文件名）
+          for cpath, r in results.items():
+              name = os.path.basename(cpath)
               if r.get("whole"):
                   ok.append({"name": name, "size": r["size"],
                              "instant": r.get("instant"), "sec": r.get("sec")})
