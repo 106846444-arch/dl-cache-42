@@ -1,21 +1,20 @@
 name: 诊断-并发上限探测
 
-# ★ 一次性诊断（2026-10-26）。实测上传并发【真天花板】。
-#   4 档太长，压成 3 档 W ∈ {14, 24, 40}（14 基线 / 24 中档 / 40 探顶），
-#   每档【40 个 200MB 随机文件】（文件数 ≥ 最大 W=40，并发槽全填满；
-#   各段总字节一致 8GB，便于横向比聚合速率；随机内容防秒传）。
-#   每段独立生成+上传+清理，磁盘峰值 ≈ 8GB。
+# ★ 一次性诊断（2026-10-26）。压短版：2 档 W ∈ {14, 40}（14 基线 vs 40 探顶），
+#   每档【40 个 100MB 随机文件】（文件数 ≥ 最大 W=40，并发槽全填满；
+#   各段总字节一致 4GB；随机内容防秒传）。每段独立生成+上传+清理，磁盘峰值 ≈ 4GB。
+#   总耗时压到约 10 分钟，直接回答「能不能到 40」。
 #
 # 关注四量（从「段汇总」后的逐文件行读，GitHub 会把含花括号的 JSON 行打码，
 #   但逐文件行/纯文本汇总行不受影响）：
 #   ① 聚合速率 = 总字节/总时长 —— 是否随 W 线性涨（平台=出口/CPU 封顶）
-#   ② 单文件均速 = 200MB/单文件用时 —— 是否随 W 掉（掉=夸克按账号限流=风控信号）
+#   ② 单文件均速 = 100MB/单文件用时 —— 是否随 W 掉（掉=夸克按账号限流=风控信号）
 #   ③ 失败数 / 龟速命中数 —— 是否随 W 上升（风控/ACK 失败面放大）
 #   ④ loadavg 均值 —— 是否逼近 vCPU 数（CPU 撞墙）
 #
-# 用法：跑完用 _dev_分析诊断.py 读四段逐文件行 → 对比上四量 →
-#   选「单文件均速不降 + 0 失败 + 聚合仍线性」的最高 W 定稿 MAX_WORKERS。
-#   清理：删云端 _diag_w14/_diag_w24/_diag_w40 → DELETE 本文件。
+# 用法：跑完用 _dev_分析诊断.py 读两段逐文件行 → 对比上四量 →
+#   若 W=40 单文件均速不降 + 0 失败，则 40 可用，定稿 MAX_WORKERS；否则取中间值复测。
+#   清理：删云端 _diag_w14/_diag_w40 → DELETE 本文件。
 
 on:
   workflow_dispatch:
@@ -23,7 +22,7 @@ on:
 jobs:
   diag:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
 
     env:
       QUARK_AUTH_JSON: ${{ secrets.QUARK_AUTH_JSON }}
@@ -205,32 +204,24 @@ jobs:
           PYEOF
           python3 -m py_compile diag_wprobe.py && echo "诊断脚本编译 OK"
 
-      - name: 3. 段W14（40×200MB）
+      - name: 3. 段W14（40×100MB）
         env:
           UPLOAD_WORKERS: "14"
         run: |
-          mkdir -p tW && for i in $(seq 1 40); do dd if=/dev/urandom of=tW/f$i.bin bs=1M count=200 status=none; done
+          mkdir -p tW && for i in $(seq 1 40); do dd if=/dev/urandom of=tW/f$i.bin bs=1M count=100 status=none; done
           python3 diag_wprobe.py _diag_w14 tW
           rm -rf tW
 
-      - name: 4. 段W24（40×200MB）
-        env:
-          UPLOAD_WORKERS: "24"
-        run: |
-          mkdir -p tW && for i in $(seq 1 40); do dd if=/dev/urandom of=tW/f$i.bin bs=1M count=200 status=none; done
-          python3 diag_wprobe.py _diag_w24 tW
-          rm -rf tW
-
-      - name: 5. 段W40（40×200MB）
+      - name: 4. 段W40（40×100MB）
         env:
           UPLOAD_WORKERS: "40"
         run: |
-          mkdir -p tW && for i in $(seq 1 40); do dd if=/dev/urandom of=tW/f$i.bin bs=1M count=200 status=none; done
+          mkdir -p tW && for i in $(seq 1 40); do dd if=/dev/urandom of=tW/f$i.bin bs=1M count=100 status=none; done
           python3 diag_wprobe.py _diag_w40 tW
           rm -rf tW
 
-      - name: 6. 完成
+      - name: 5. 完成
         run: |
-          echo "诊断完成。回本机用 _dev_分析诊断.py 读三段逐文件行，对比："
+          echo "诊断完成。回本机用 _dev_分析诊断.py 读两段逐文件行，对比："
           echo "  聚合速率 / 单文件均速(掉=夸克按账号限流) / 失败·龟速数 / loadavg"
-          echo "清理提醒：删 _diag_w14/_diag_w24/_diag_w40 后 DELETE 本 workflow。"
+          echo "清理提醒：删 _diag_w14/_diag_w40 后 DELETE 本 workflow。"
