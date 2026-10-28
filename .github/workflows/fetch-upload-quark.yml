@@ -361,6 +361,14 @@ jobs:
                   continue
               if sz < 1048576:
                   print("  ::warning:: %s 只有 %d 字节，丢弃" % (name, sz))
+                  # ★ 2026-10-28：把响应体打出来——Wrong IP / 过期等拒绝报文
+                  #   就藏在这几十字节里，不打出来永远只能靠猜
+                  try:
+                      with open(path, "rb") as _sf:
+                          _body = _sf.read(200)
+                      print("  ::warning:: %s 响应体: %r" % (name, _body[:120]))
+                  except Exception:
+                      pass
                   for _p in (path, tmp):
                       if os.path.exists(_p):
                           os.remove(_p)
@@ -715,13 +723,30 @@ jobs:
           def _sub_folder(path):
               """给分卷文件建子文件夹（幂等，带重试），返回 fid。
               ★ 2026-10-26 唯一化：目录名用 key__name（key 从 path 反推），
-              两个同名任务云端各自独立目录，part 不再同名冲突。"""
+              两个同名任务云端各自独立目录，part 不再同名冲突。
+              ★ 2026-10-28 修（run #50 血泪）：create-folder 加 5 次重试
+              （step3 同款——run #7 实测遇到过瞬时 1007「创建操作失败」）；
+              仍失败则【抛异常】。以前失败时静默兜底返回根目录 fid，
+              导致该文件全部分卷散落上传到 UP 根目录：卷数核对对不上、
+              失败后清理也只清目录不清根目录残卷、软件把完整文件误判
+              成失败（nh72/hpal14/ltxs6/xiaoxin9 四条全这么中招）。"""
               name = os.path.basename(path)
               key = os.path.basename(os.path.dirname(path))
               dir_path = "%s__%s" % (key, name)
-              res = cli(["create-folder", "--dir-path", dir_path, "--parent-fid", fid])
-              return ((res.get("data") or {}).get("fid")
-                      or (res.get("data") or {}).get("id") or fid)
+              res = {}
+              for _try in range(5):
+                  res = cli(["create-folder", "--dir-path", dir_path,
+                             "--parent-fid", fid])
+                  sub = ((res.get("data") or {}).get("fid")
+                         or (res.get("data") or {}).get("id"))
+                  if sub:
+                      return sub
+                  print("  ↻ create-folder 第%d次失败: %s %s"
+                        % (_try + 1, res.get("code"), res.get("msg")), flush=True)
+                  time.sleep(8)
+              raise RuntimeError(
+                  "建分卷目录失败(已重试5次，不兜底根目录): %s -> %s"
+                  % (dir_path, json.dumps(res, ensure_ascii=False)[:200]))
 
           def _split_serial(cpath, path, sz):
               """降级路径：整传失败后在调用线程内串行切+传（磁盘峰值 = 文件+1卷）。
@@ -774,7 +799,18 @@ jobs:
                           nvol = (sz + VOL_SIZE - 1) // VOL_SIZE
                           print("⚠ %s 有 %d 字节 → 切成 %d 个 500MB 卷分别上传"
                                 % (name, sz, nvol), flush=True)
-                          sub_fid = _sub_folder(path)
+                          # ★ 2026-10-28：建目录失败只标记【这一个文件】失败，
+                          #   不再连累整批（以前异常冒到 producer 外层，
+                          #   会把本批所有文件一起判失败）。
+                          try:
+                              sub_fid = _sub_folder(path)
+                          except Exception as e:
+                              print("::error::%s: %s" % (name, e), flush=True)
+                              with results_lock:
+                                  results[path] = {
+                                      "size": sz, "parts": [], "t0": time.time(),
+                                      "failed": [{"name": name, "msg": str(e)}]}
+                              continue
                           sub_fids[path] = sub_fid
                           orig_keep[path] = path   # ★ 保留原文件，供缺卷补传重切
                           nvol_map[path] = nvol
@@ -892,7 +928,13 @@ jobs:
                   path = orig_keep[cpath]
                   sz = r["size"]
                   nvol = nvol_map.get(cpath) or 0
-                  sub_fid = sub_fids.get(cpath) or fid
+                  sub_fid = sub_fids.get(cpath)
+                  if not sub_fid:
+                      # ★ 2026-10-28：没有分卷目录 fid 时【跳过补传】，
+                      #   绝不再兜底根目录（散落根目录的根源之一）。
+                      print("  ✗ 补传跳过 %s：没有分卷目录 fid（拒绝兜底根目录）"
+                            % nm, flush=True)
+                      continue
                   nm = os.path.basename(cpath)
                   done_names = {p.get("name") for p in (r.get("parts") or [])}
                   print("↻ 补传 %s：缺 %d 卷（%s）"
@@ -940,7 +982,12 @@ jobs:
                           os.remove(path)
                       except Exception:
                           pass
-                      orig_keep.pop(name, None)
+                      # ★ 2026-10-28 修（run#43 实证）：原来写的是 orig_keep.pop(name)
+                      #   —— name 在本函数未定义（只有 nm），且 orig_keep 的 key 是
+                      #   完整路径 cpath 不是 basename。补传全成后走到这必 NameError
+                      #   崩掉整个上传步骤 → 结果摘要没输出 → 软件把整批判失败，
+                      #   而云端其实已传完。key 必须用 cpath。
+                      orig_keep.pop(cpath, None)
 
           for _rnd in range(BACKFILL_ROUNDS):
               if not any(rr.get("failed") for rr in results.values()):
