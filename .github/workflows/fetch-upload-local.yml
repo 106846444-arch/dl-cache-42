@@ -1,0 +1,465 @@
+name: UP本地下载（机房代抓 → 发 Release）
+
+# ★ 2026-11-04 v2。供软件「④b UP本地下载」页使用。
+#   与 fetch-upload-quark.yml（机房直传夸克）的区别：
+#     · quark.yml：机房下载 → 机房直传夸克（文件不落本地）
+#     · 本 yml：机房下载 → 发 Release（本地软件按 tag 取附件、从国内镜像高速拉回本地盘）
+#
+#   v2 按 DSH 审核意见修订：
+#     · P0-7 失败不吞：step3 无 done 非 0 退出；step4 发 Release 失败非 0；附件数对账
+#     · P0-4 元数据：产出 _meta.json（含 sha256）+ skipped.txt，本地不当媒体下载
+#     · P1-6 重名：release 附件名加 url hash 前缀（hash__name），本地按 _meta.json 还原
+#     · P1-7 边界：sz >= 1.9GiB 就切 500MB 卷（留余量）
+#     · P1-2 哈希：dl_result.json 带每文件/每卷 sha256
+#     · concurrency：避免两次同时跑
+
+on:
+  workflow_dispatch:
+    inputs:
+      items_b64:
+        description: 'base64(JSON数组)，每项 {"name":"文件名","page_url":"文件页URL"}'
+        required: true
+      cookie:
+        description: '站点登录 Cookie（用于 resolve_page 换直链）'
+        required: false
+        default: ''
+      threads:
+        description: '每文件的下载并发连接数'
+        required: false
+        default: '8'
+
+# ★ P1 补充：避免两次 UP本地下载同时跑（同仓库同 workflow 串行）
+concurrency:
+  group: up42-local-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  fetch_release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    env:
+      ITEMS_B64: ${{ inputs.items_b64 }}
+      COOKIE: ${{ inputs.cookie }}
+      THREADS: ${{ inputs.threads }}
+      UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      HARD_MAX_BYTES: 12884901888
+      # ★ P0-2：切卷阈值与 step3 共用同一个值，避免两处硬编码不一致
+      SPLIT_LIMIT_BYTES: 2040109465
+
+    steps:
+      - name: 0. 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 1. 解析任务清单
+        run: |
+          python3 - <<'PYEOF'
+          import base64, json, os
+          items = json.loads(base64.b64decode(os.environ["ITEMS_B64"]).decode("utf-8"))
+          print("共 %d 个任务" % len(items))
+          for it in items:
+              print("  -", it.get("name"), "->", (it.get("page_url") or "")[:110])
+          PYEOF
+          echo "--- runner 磁盘实况 ---"
+          df -h . | tail -1
+          python3 -c "import shutil;print('可用字节:', shutil.disk_usage('.').free)"
+
+      - name: 2. 多线程 Range 下载
+        run: |
+          cat > dl.py <<'PYEOF'
+          import base64, hashlib, json, os, sys, threading, time, urllib.request
+          import shutil
+
+          items = json.loads(base64.b64decode(os.environ["ITEMS_B64"]).decode("utf-8"))
+          COOKIE = os.environ.get("COOKIE", "")
+          THREADS = max(int(os.environ.get("THREADS") or 8), 1)
+          UA = os.environ.get("UA", "Mozilla/5.0")
+          HARD_MAX = int(os.environ.get("HARD_MAX_BYTES", "12884901888"))
+          OUT = "out"
+          os.makedirs(OUT, exist_ok=True)
+          done, skipped = [], []
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1 << 20), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          def hdrs(ref=None):
+              h = {"User-Agent": UA}
+              if ref:
+                  h["Referer"] = ref
+              if COOKIE:
+                  h["Cookie"] = COOKIE
+              return h
+
+          def probe(u, ref):
+              try:
+                  req = urllib.request.Request(u, headers=dict(hdrs(ref), Range="bytes=0-0"))
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      cr = r.headers.get("Content-Range") or ""
+                      code = r.getcode()
+                      r.read(64)
+                      if code == 206 and "/" in cr:
+                          return int(cr.rsplit("/", 1)[-1]), True
+                      cl = r.headers.get("Content-Length")
+                      return (int(cl) if cl else 0), False
+              except Exception as e:
+                  print("  探测失败: %s" % e)
+                  return 0, False
+
+          def resolve_page(it):
+              """★ upload42 / 同类 XFS 站点：给【文件页 URL】，机房自己换直链。
+              POST op=download2 + method_premium=1，取 302 的 Location。
+              ★ P1-5：429/503 退避重试 2 次；Location 用 urljoin 处理相对地址。"""
+              import re, urllib.parse, urllib.error, time as _t
+              u = (it.get("page_url") or "").strip()
+              if not u:
+                  return ""
+              cookie = it.get("cookie") or COOKIE
+              m = re.match(r"https?://[^/]+/([A-Za-z0-9]+)/.*", u)
+              fid = m.group(1) if m else ""
+              data = urllib.parse.urlencode({
+                  "op": "download2", "id": fid, "rand": "",
+                  "referer": "https://www.upload42.com/",
+                  "method_free": "", "method_premium": "1",
+              }).encode()
+
+              class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, req, fp, code, msg, headers, newurl):
+                      raise urllib.error.HTTPError(req.full_url, code, newurl, headers, fp)
+
+              for _attempt in range(3):
+                  req = urllib.request.Request(u, data=data, headers={
+                      "User-Agent": UA,
+                      "Content-Type": "application/x-www-form-urlencoded",
+                      "Cookie": cookie, "Referer": u})
+                  try:
+                      urllib.request.build_opener(_NoRedirect).open(req, timeout=60)
+                      return ""
+                  except urllib.error.HTTPError as e:
+                      if e.code in (429, 503) and _attempt < 2:
+                          _t.sleep(5 * (_attempt + 1))   # 退避重试
+                          continue
+                      if e.headers:
+                          loc = e.headers.get("Location") or ""
+                          # ★ P1-5：相对地址用 urljoin 补全
+                          return urllib.parse.urljoin(u, loc) if loc else ""
+                      return ""
+                  except Exception as e:
+                      if _attempt < 2:
+                          _t.sleep(5)
+                          continue
+                      print("  换直链失败: %s" % e)
+                      return ""
+              return ""
+
+          def safe_name(n):
+              n = (n or "").strip() or "file.bin"
+              for c in '/\\:*?"<>|':
+                  n = n.replace(c, "_")
+              return n[:180]
+
+          def parallel(u, ref, total, path):
+              with open(path, "wb") as f:
+                  f.truncate(total)
+              chunk = max(total // THREADS, 1)
+              errs = []
+              got = [0]
+              lock = threading.Lock()
+
+              def worker(i):
+                  s = i * chunk
+                  e = min(s + chunk - 1, total - 1)
+                  pos = s
+                  if s > e:
+                      return
+                  for attempt in range(10):
+                      try:
+                          req = urllib.request.Request(
+                              u, headers=dict(hdrs(ref), Range="bytes=%d-%d" % (pos, e)))
+                          with urllib.request.urlopen(req, timeout=180) as r:
+                              if r.getcode() != 206:
+                                  raise RuntimeError("HTTP %s" % r.getcode())
+                              with open(path, "r+b") as f:
+                                  f.seek(pos)
+                                  while True:
+                                      b = r.read(1 << 19)
+                                      if not b:
+                                          break
+                                      f.write(b)
+                                      pos += len(b)
+                                      with lock:
+                                          got[0] += len(b)
+                          if pos > e:
+                              return
+                      except Exception as ex:
+                          if attempt == 9:
+                              errs.append((i, str(ex)))
+                          else:
+                              time.sleep(3)
+                  if pos <= e:
+                      errs.append((i, "未完成 %d-%d" % (pos, e)))
+
+              ts = [threading.Thread(target=worker, args=(i,), daemon=True)
+                    for i in range(THREADS)]
+              t0 = time.time()
+              for t in ts:
+                  t.start()
+              while any(t.is_alive() for t in ts):
+                  time.sleep(15)
+                  el = time.time() - t0
+                  print("    ... %.1fMB / %.1fMB  %.2fMB/s  (%.0fs)"
+                        % (got[0] / 1048576.0, total / 1048576.0,
+                           got[0] / 1048576.0 / max(el, 1), el), flush=True)
+              for t in ts:
+                  t.join(30)
+              return errs, time.time() - t0
+
+          def single(u, ref, path):
+              t0 = time.time()
+              for attempt in range(10):
+                  try:
+                      req = urllib.request.Request(u, headers=hdrs(ref))
+                      with urllib.request.urlopen(req, timeout=180) as r, open(path, "wb") as f:
+                          # ★ P1-3：校验 Content-Length，提前 EOF 判失败，不静默通过
+                          expect = r.headers.get("Content-Length")
+                          got = 0
+                          while True:
+                              b = r.read(1 << 19)
+                              if not b:
+                                  break
+                              f.write(b)
+                              got += len(b)
+                          if expect is not None and int(expect) != got:
+                              raise IOError("截断 %d/%s" % (got, expect))
+                      return [], time.time() - t0
+                  except Exception as e:
+                      if attempt == 9:
+                          return [(0, str(e))], time.time() - t0
+                      time.sleep(5)
+
+          for idx, it in enumerate(items, 1):
+              name = safe_name(it.get("name"))
+              u = (it.get("url") or "").strip()
+              ref = it.get("referer") or ""
+              print("---- [%d/%d] %s ----" % (idx, len(items), name), flush=True)
+              if not u and it.get("page_url"):
+                  if not name or name == "file.bin":
+                      import re as _re
+                      name = safe_name(_re.sub(r"\.html$", "",
+                                       (it.get("page_url") or "").rsplit("/", 1)[-1]))
+                  u = resolve_page(it)
+                  print("  换直链 -> %s" % ((u or "失败")[:100]), flush=True)
+              if not u:
+                  skipped.append("%s\t没有直链/换链失败" % name)
+                  continue
+              total, rng = probe(u, ref)
+              # ★ P1-3：total=0（探测不到大小）也做保守磁盘保护，不绕过
+              if total and total > HARD_MAX:
+                  skipped.append("%s\t%d字节超磁盘上限" % (name, total))
+                  continue
+              try:
+                  _free = shutil.disk_usage(OUT).free
+              except Exception:
+                  _free = 0
+              DISK_RESERVE = 2 * 1024 * 1024 * 1024
+              # ★ P0-2：切卷时原件+全部卷瞬时并存（峰值≈2×），预检按 2× 估
+              SPLIT_LIMIT = int(os.environ.get("SPLIT_LIMIT_BYTES") or int(1.9 * 1024 ** 3))
+              _need = (total * 2) if (total and total > SPLIT_LIMIT) else total
+              if _need and _free and (_need + DISK_RESERVE) > _free:
+                  skipped.append("%s\t机房剩余磁盘不足(切卷需2x)" % name)
+                  print("  ::warning:: 磁盘不足(切卷需2x)，跳过 %s" % name, flush=True)
+                  continue
+              # ★ P1-3：total=0 时无法精估，但至少保证还有 DISK_RESERVE 以上空间才继续
+              if not total and _free and _free <= DISK_RESERVE:
+                  skipped.append("%s\t机房剩余磁盘不足(无法探大小)" % name)
+                  print("  ::warning:: 磁盘不足(无法探大小)，跳过 %s" % name, flush=True)
+                  continue
+              key = hashlib.md5(u.encode("utf-8")).hexdigest()[:8]
+              path = os.path.join(OUT, key, name)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              tmp = path + ".part"
+              if rng and total:
+                  errs, el = parallel(u, ref, total, tmp)
+              else:
+                  errs, el = single(u, ref, tmp)
+              if os.path.exists(tmp):
+                  if os.path.exists(path):
+                      os.remove(path)
+                  os.replace(tmp, path)
+              if not os.path.exists(path):
+                  skipped.append("%s\t下载失败" % name)
+                  continue
+              sz = os.path.getsize(path)
+              if errs or (total and sz != total):
+                  why = ("分片错误 %s" % errs[:2]) if errs else ("大小 %d≠%d" % (sz, total))
+                  print("  ::warning:: %s 不完整: %s" % (name, why))
+                  for _p in (path, tmp):
+                      if os.path.exists(_p):
+                          os.remove(_p)
+                  skipped.append("%s\t%s" % (name, why))
+                  continue
+              if sz < 1048576:
+                  print("  ::warning:: %s 只有 %d 字节，丢弃" % (name, sz))
+                  try:
+                      with open(path, "rb") as _sf:
+                          _body = _sf.read(200)
+                      print("  ::warning:: %s 响应体: %r" % (name, _body[:120]))
+                  except Exception:
+                      pass
+                  for _p in (path, tmp):
+                      if os.path.exists(_p):
+                          os.remove(_p)
+                  skipped.append("%s\t只有%d字节" % (name, sz))
+                  continue
+              print("  ✓ %s  %d字节  用时 %.1fs  均速 %.2fMB/s"
+                    % (name, sz, el, sz / 1048576.0 / max(el, 1)), flush=True)
+              # ★ P1-2：带 sha256，本地做内容校验
+              # ★ P0-A：同时记录 page_url，供本地映射回原书签搬「1」
+              done.append({"name": name, "path": path, "size": sz,
+                           "sha256": sha256(path),
+                           "page_url": it.get("page_url") or u})
+
+          json.dump({"done": done, "skipped": skipped},
+                    open("dl_result.json", "w", encoding="utf-8"))
+          print("---- 下载完成：成功 %d / 跳过 %d ----" % (len(done), len(skipped)))
+          # ★ P0-7：一个都没下下来必须非 0 退出（不能当成功）
+          if not done:
+              print("::error::一个文件都没下下来")
+              sys.exit(1)
+          PYEOF
+          python3 dl.py
+
+      - name: 3. 大文件分卷（>=1.9GiB 切 500MB 卷，绕开 Release 单附件上限）
+        if: success() || failure()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, shutil, hashlib
+          VOL = 500 * 1024 * 1024
+          # ★ P0-2：LIMIT 从环境变量读，与 step2 预检用同一个值（避免两处硬编码不一致）
+          LIMIT = int(os.environ.get("SPLIT_LIMIT_BYTES") or int(1.9 * 1024 ** 3))
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for b in iter(lambda: f.read(1 << 20), b""):
+                      h.update(b)
+              return h.hexdigest()
+
+          # ★ P0-7：dl_result.json 不存在 = 下载阶段失败，非 0 退出
+          if not os.path.exists("dl_result.json"):
+              print("::error::dl_result.json 不存在，机房下载阶段失败")
+              raise SystemExit(1)
+          r = json.load(open("dl_result.json", encoding="utf-8"))
+          if not (r.get("done") or []):
+              print("::error::一个文件都没下下来")
+              raise SystemExit(1)
+
+          # 集中搬到 release/ 目录，附件名加 hash 前缀（P1-6 防重名）
+          os.makedirs("release", exist_ok=True)
+          # ★ P0-A：_meta.json 用 files/parts schema，本地把它当【唯一对账源】。
+          #   这里遍历 done，按 done 的顺序把每个文件的 release 附件名收集到 parts，
+          #   附件名 = hash__base（hash 用 page_url 的 md5 前 8 位，稳定可复现）。
+          meta = {"files": [], "skipped": (r.get("skipped") or [])}
+          for rec in (r.get("done") or []):
+              pu = rec.get("page_url") or ""
+              # ★ P2：hash 用 page_url，空时兑底到 name，避免同名 hash 冲突
+              _hash_src = pu or (rec.get("name") or "")
+              h = hashlib.md5(_hash_src.encode("utf-8")).hexdigest()[:8]
+              base = os.path.basename(rec["path"])
+              parts = []
+              if rec["size"] <= LIMIT:
+                  # 小文件：整个搬过去
+                  asset = h + "__" + base
+                  dst = os.path.join("release", asset)
+                  shutil.move(rec["path"], dst)
+                  parts.append({"asset": asset, "size": rec["size"],
+                                "sha256": sha256(dst)})
+              else:
+                  # 大文件：现场切 500MB 卷（P1-7），整文件本身不发布
+                  nvol = (rec["size"] + VOL - 1) // VOL
+                  print("分卷 %s: %d 字节 -> %d 卷" % (base, rec["size"], nvol))
+                  with open(rec["path"], "rb") as f:
+                      for vi in range(1, nvol + 1):
+                          pname = "%s.part%03d" % (base, vi)
+                          asset = h + "__" + pname
+                          dst = os.path.join("release", asset)
+                          remain = min(VOL, rec["size"] - (vi - 1) * VOL)
+                          left = remain
+                          with open(dst, "wb") as pf:
+                              while left > 0:
+                                  b = f.read(min(1 << 20, left))
+                                  if not b:
+                                      break
+                                  pf.write(b)
+                                  left -= len(b)
+                          parts.append({"asset": asset,
+                                        "size": os.path.getsize(dst),
+                                        "sha256": sha256(dst)})
+                  try:
+                      os.remove(rec["path"])
+                  except Exception:
+                      pass
+              # 分卷情况：size/sha256 是合并后的整体（本地合并后再比）
+              meta["files"].append({
+                  "page_url": pu,
+                  "orig": base,
+                  "size": rec["size"],
+                  "sha256": rec["sha256"],
+                  "parts": parts,
+              })
+          print("release/ 目录内容：")
+          for f in sorted(os.listdir("release")):
+              print("  ", f, os.path.getsize(os.path.join("release", f)), "字节")
+          # ★ P0-4：元数据写成 _meta.json（files/parts schema），本地显式跳过它
+          json.dump(meta, open("release/_meta.json", "w", encoding="utf-8"))
+          # ★ P0-4：skipped.txt 列出没下来的文件，本地读它展示失败原因
+          with open("release/skipped.txt", "w", encoding="utf-8") as f:
+              for s in (r.get("skipped") or []):
+                  f.write(s + "\n")
+          PYEOF
+
+      - name: 4. 发 Release（tag=up42-local-{run_number}）
+        # ★ P0-D：只在前面步骤全部成功时发布。step3 失败不发布，避免孤儿 Release。
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="up42-local-${{ github.run_number }}"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          # ★ P0-7：发 Release 失败让 job 失败（不吞错）
+          gh release create "$TAG" \
+            ./release/* \
+            --repo "${{ github.repository }}" \
+            --title "UP本地下载 批次 #${{ github.run_number }}" \
+            --notes "机房代抓完成，软件按此 tag 取附件镜像拉回本地" \
+            --prerelease
+          echo "--- 附件数对账 ---"
+          COUNT=$(gh release view "$TAG" \
+            --repo "${{ github.repository }}" --json assets --jq '.assets | length')
+          EXPECT=$(find release -maxdepth 1 -type f | wc -l)
+          echo "Release 附件 $COUNT / release 目录文件 $EXPECT"
+          # ★ P1-3：附件数必须等于 release/ 里的文件数
+          test "$COUNT" -eq "$EXPECT" || { echo "::error::附件数 $COUNT != $EXPECT"; exit 1; }
+
+      - name: 5. 结果摘要
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import base64, json, os
+          # ★ P0-7：step5 只做摘要，不改变 job 结论（不吞错）
+          # ★ P2：RESULT_B64 仅供人工排查（新页本地不消费它，本地读的是 Release 的 _meta.json）
+          def _b64_nopad(d):
+              raw = json.dumps(d, ensure_ascii=False).encode("utf-8")
+              while len(raw) % 3:
+                  raw += b" "
+              return base64.b64encode(raw).decode("ascii")
+          if os.path.exists("dl_result.json"):
+              d = json.load(open("dl_result.json", encoding="utf-8"))
+              print("RESULT_B64 dl_result.json %s" % _b64_nopad(d))
+          PYEOF
