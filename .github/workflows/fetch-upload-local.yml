@@ -418,9 +418,14 @@ jobs:
           # ★ P0-4：元数据写成 _meta.json（files/parts schema），本地显式跳过它
           json.dump(meta, open("release/_meta.json", "w", encoding="utf-8"))
           # ★ P0-4：skipped.txt 列出没下来的文件，本地读它展示失败原因
-          with open("release/skipped.txt", "w", encoding="utf-8") as f:
-              for s in (r.get("skipped") or []):
-                  f.write(s + "\n")
+          # ★ 修复(2026-11-05)：skipped 为空时不生成 skipped.txt，避免 0 字节附件
+          #   gh release create 上传 0 字节文件会报 HTTP 400 Bad Content-Length，
+          #   导致整个发 Release 步骤失败（下好的文件也发不出去）。
+          _skipped = r.get("skipped") or []
+          if _skipped:
+              with open("release/skipped.txt", "w", encoding="utf-8") as f:
+                  for s in _skipped:
+                      f.write(s + "\n")
           PYEOF
 
       - name: 4. 发 Release（tag=up42-local-{run_number}）
