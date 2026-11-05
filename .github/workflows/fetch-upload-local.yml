@@ -161,6 +161,9 @@ jobs:
               n = (n or "").strip() or "file.bin"
               for c in '/\\:*?"<>|':
                   n = n.replace(c, "_")
+              # ★ 修复(2026-11-05)：空格也替换成 _，避免 GitHub Release 附件
+              #   把空格转成 . 导致 _meta.json 的 asset 名与真实附件名对不上。
+              n = n.replace(" ", "_")
               return n[:180]
 
           def parallel(u, ref, total, path):
